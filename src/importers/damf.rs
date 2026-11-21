@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde::de::{self, Visitor};
@@ -177,7 +177,7 @@ impl DamfImporter {
     pub fn from_parts<R: Read + Seek + Send + 'static>(
         manifest_yaml: &str,
         metadata_yaml: &str,
-        caf_stream: Arc<Mutex<SharedCafStream<R>>>,
+        caf_stream: Arc<SharedCafStream<R>>,
     ) -> Result<Scene, ImportError> {
         let manifest: DamfManifest = serde_yaml_ng::from_str(manifest_yaml)?;
         let presentation = manifest.presentations.first().ok_or_else(|| {
@@ -185,10 +185,7 @@ impl DamfImporter {
         })?;
         let metadata: DamfMetadata = serde_yaml_ng::from_str(metadata_yaml)?;
 
-        let caf_info = caf_stream
-            .lock()
-            .map_err(|_| ImportError::InvalidDescriptor("CAF mutex poisoned".into()))?
-            .info();
+        let caf_info = caf_stream.info();
         let sample_rate = metadata.sample_rate.unwrap_or(caf_info.sample_rate);
         if sample_rate != caf_info.sample_rate {
             return Err(ImportError::InvalidDescriptor(format!(

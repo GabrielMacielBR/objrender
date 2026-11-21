@@ -3,12 +3,13 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::io::IoError;
 use crate::scene::AudioSource;
 
 const CACHE_BLOCK_FRAMES: usize = 4096;
+const CACHE_SLOTS: usize = 64;
 const CAF_FORMAT_FLAG_FLOAT: u32 = 1 << 0;
 const CAF_FORMAT_FLAG_LITTLE_ENDIAN: u32 = 1 << 1;
 
@@ -154,79 +155,170 @@ pub fn inspect_caf<R: Read + Seek>(reader: &mut R) -> Result<CafInfo, IoError> {
     })
 }
 
-/// Shared seekable CAF stream with a planar block cache so multiple object channels
-/// read sequential blocks with minimal disk seeks.
-pub struct SharedCafStream<R: Read + Seek> {
-    reader: R,
-    info: CafInfo,
-    cached_start: u64,
+struct DecodedCafBlock {
+    block_idx: u64,
     cached_len: usize,
-    planar_cache: Vec<Vec<f64>>,
-    raw_buf: Vec<u8>,
+    planar: Vec<Vec<f64>>,
+}
+
+struct CafBlockCache {
+    slots: Vec<Arc<DecodedCafBlock>>,
+    next_evict: usize,
+    free_blocks: Vec<DecodedCafBlock>,
+    free_raw_bufs: Vec<Vec<u8>>,
+}
+
+/// Shared seekable CAF stream with a lock-split 64-slot decoded block cache and buffer
+/// recycling so concurrent worker threads read hits via `RwLock::read` and decode misses
+/// in parallel without holding any lock.
+pub struct SharedCafStream<R: Read + Seek> {
+    reader: Mutex<R>,
+    info: CafInfo,
+    cache: RwLock<CafBlockCache>,
 }
 
 impl SharedCafStream<File> {
-    pub fn open(path: impl AsRef<Path>) -> Result<Arc<Mutex<Self>>, IoError> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Arc<Self>, IoError> {
         let file = File::open(path)?;
         Self::from_reader(file)
     }
 }
 
 impl<R: Read + Seek> SharedCafStream<R> {
-    pub fn from_reader(mut reader: R) -> Result<Arc<Mutex<Self>>, IoError> {
+    pub fn from_reader(mut reader: R) -> Result<Arc<Self>, IoError> {
         let info = inspect_caf(&mut reader)?;
-        let planar_cache = vec![vec![0.0; CACHE_BLOCK_FRAMES]; info.num_channels];
-        let raw_buf = vec![0u8; CACHE_BLOCK_FRAMES * info.bytes_per_frame];
-        Ok(Arc::new(Mutex::new(Self {
-            reader,
+        Ok(Arc::new(Self {
+            reader: Mutex::new(reader),
             info,
-            cached_start: 0,
-            cached_len: 0,
-            planar_cache,
-            raw_buf,
-        })))
+            cache: RwLock::new(CafBlockCache {
+                slots: Vec::with_capacity(CACHE_SLOTS),
+                next_evict: 0,
+                free_blocks: Vec::new(),
+                free_raw_bufs: Vec::new(),
+            }),
+        }))
     }
 
     pub fn info(&self) -> CafInfo {
         self.info
     }
 
-    fn fill_cache(&mut self, start_frame: u64) -> Result<(), IoError> {
-        if start_frame >= self.info.total_frames {
-            self.cached_start = start_frame;
-            self.cached_len = 0;
-            return Ok(());
-        }
-        let avail = ((self.info.total_frames - start_frame) as usize).min(CACHE_BLOCK_FRAMES);
-        let byte_offset = self.info.data_offset + start_frame * (self.info.bytes_per_frame as u64);
-        let byte_count = avail * self.info.bytes_per_frame;
-
-        self.reader.seek(SeekFrom::Start(byte_offset))?;
-        self.reader.read_exact(&mut self.raw_buf[..byte_count])?;
-
-        let n_ch = self.info.num_channels;
-        let bps = self.info.bytes_per_frame / n_ch;
-        for f in 0..avail {
-            let frame_base = f * self.info.bytes_per_frame;
-            for ch in 0..n_ch {
-                let s_base = frame_base + ch * bps;
-                let sample = decode_sample(
-                    &self.raw_buf[s_base..s_base + bps],
-                    self.info.is_float,
-                    self.info.bits_per_channel,
-                    self.info.is_little_endian,
-                );
-                self.planar_cache[ch][f] = sample;
+    fn get_or_decode_block(&self, block_idx: u64) -> Result<Arc<DecodedCafBlock>, IoError> {
+        {
+            let guard = self
+                .cache
+                .read()
+                .map_err(|_| IoError::InvalidConfig("CAF cache read lock poisoned".into()))?;
+            if let Some(existing) = guard.slots.iter().find(|b| b.block_idx == block_idx) {
+                return Ok(Arc::clone(existing));
             }
         }
 
-        self.cached_start = start_frame;
-        self.cached_len = avail;
-        Ok(())
+        let (mut raw_buf, mut block) = {
+            let mut guard = self
+                .cache
+                .write()
+                .map_err(|_| IoError::InvalidConfig("CAF cache write lock poisoned".into()))?;
+            if let Some(existing) = guard.slots.iter().find(|b| b.block_idx == block_idx) {
+                return Ok(Arc::clone(existing));
+            }
+            let raw_buf = guard
+                .free_raw_bufs
+                .pop()
+                .unwrap_or_else(|| vec![0u8; CACHE_BLOCK_FRAMES * self.info.bytes_per_frame]);
+            let block = guard.free_blocks.pop().unwrap_or_else(|| DecodedCafBlock {
+                block_idx,
+                cached_len: 0,
+                planar: vec![vec![0.0; CACHE_BLOCK_FRAMES]; self.info.num_channels],
+            });
+            (raw_buf, block)
+        };
+
+        let start_frame = block_idx * (CACHE_BLOCK_FRAMES as u64);
+        let avail = if start_frame >= self.info.total_frames {
+            0
+        } else {
+            ((self.info.total_frames - start_frame) as usize).min(CACHE_BLOCK_FRAMES)
+        };
+        let byte_count = avail * self.info.bytes_per_frame;
+
+        if avail > 0 {
+            let byte_offset =
+                self.info.data_offset + start_frame * (self.info.bytes_per_frame as u64);
+            let read_res = {
+                let mut reader = self
+                    .reader
+                    .lock()
+                    .map_err(|_| IoError::InvalidConfig("CAF reader mutex poisoned".into()))?;
+                reader
+                    .seek(SeekFrom::Start(byte_offset))
+                    .and_then(|_| reader.read_exact(&mut raw_buf[..byte_count]))
+            };
+            if let Err(err) = read_res {
+                if let Ok(mut guard) = self.cache.write() {
+                    if guard.free_raw_bufs.len() < CACHE_SLOTS {
+                        guard.free_raw_bufs.push(raw_buf);
+                    }
+                    if guard.free_blocks.len() < CACHE_SLOTS {
+                        guard.free_blocks.push(block);
+                    }
+                }
+                return Err(err.into());
+            }
+
+            decode_interleaved_to_planar(
+                &raw_buf[..byte_count],
+                &self.info,
+                avail,
+                &mut block.planar,
+            );
+        }
+
+        block.block_idx = block_idx;
+        block.cached_len = avail;
+        let arc_block = Arc::new(block);
+
+        let mut guard = self
+            .cache
+            .write()
+            .map_err(|_| IoError::InvalidConfig("CAF cache write lock poisoned".into()))?;
+        if guard.free_raw_bufs.len() < CACHE_SLOTS {
+            guard.free_raw_bufs.push(raw_buf);
+        }
+        if let Some(existing) = guard.slots.iter().find(|b| b.block_idx == block_idx) {
+            let ret = Arc::clone(existing);
+            drop(guard);
+            if let Ok(unused) = Arc::try_unwrap(arc_block)
+                && let Ok(mut g) = self.cache.write()
+                && g.free_blocks.len() < CACHE_SLOTS
+            {
+                g.free_blocks.push(unused);
+            }
+            return Ok(ret);
+        }
+
+        let evicted = if guard.slots.len() < CACHE_SLOTS {
+            guard.slots.push(Arc::clone(&arc_block));
+            None
+        } else {
+            let evict_idx = guard.next_evict;
+            guard.next_evict = (guard.next_evict + 1) % CACHE_SLOTS;
+            Some(std::mem::replace(
+                &mut guard.slots[evict_idx],
+                Arc::clone(&arc_block),
+            ))
+        };
+        if let Some(old_arc) = evicted
+            && let Ok(old_block) = Arc::try_unwrap(old_arc)
+            && guard.free_blocks.len() < CACHE_SLOTS
+        {
+            guard.free_blocks.push(old_block);
+        }
+        Ok(arc_block)
     }
 
     fn read_channel_frames(
-        &mut self,
+        &self,
         channel: usize,
         mut frame_offset: u64,
         out: &mut [f64],
@@ -240,19 +332,16 @@ impl<R: Read + Seek> SharedCafStream<R> {
         let mut written = 0usize;
 
         while written < total_to_read {
-            let cache_end = self.cached_start + self.cached_len as u64;
-            if self.cached_len == 0 || frame_offset < self.cached_start || frame_offset >= cache_end
-            {
-                self.fill_cache(frame_offset)?;
-                if self.cached_len == 0 {
-                    break;
-                }
+            let block_idx = frame_offset / (CACHE_BLOCK_FRAMES as u64);
+            let in_cache_offset = (frame_offset % (CACHE_BLOCK_FRAMES as u64)) as usize;
+            let block = self.get_or_decode_block(block_idx)?;
+            if block.cached_len <= in_cache_offset {
+                break;
             }
 
-            let in_cache_offset = (frame_offset - self.cached_start) as usize;
-            let copy_count = (self.cached_len - in_cache_offset).min(total_to_read - written);
+            let copy_count = (block.cached_len - in_cache_offset).min(total_to_read - written);
             out[written..written + copy_count].copy_from_slice(
-                &self.planar_cache[channel][in_cache_offset..in_cache_offset + copy_count],
+                &block.planar[channel][in_cache_offset..in_cache_offset + copy_count],
             );
 
             written += copy_count;
@@ -265,17 +354,14 @@ impl<R: Read + Seek> SharedCafStream<R> {
 
 /// Mono [`AudioSource`] backed by one channel of a [`SharedCafStream`].
 pub struct CafChannelSource<R: Read + Seek + Send> {
-    shared: Arc<Mutex<SharedCafStream<R>>>,
+    shared: Arc<SharedCafStream<R>>,
     channel: usize,
     total_frames: u64,
 }
 
 impl<R: Read + Seek + Send> CafChannelSource<R> {
-    pub fn new(shared: Arc<Mutex<SharedCafStream<R>>>, channel: usize) -> Result<Self, IoError> {
-        let info = shared
-            .lock()
-            .map_err(|_| IoError::InvalidConfig("CAF stream mutex poisoned".into()))?
-            .info();
+    pub fn new(shared: Arc<SharedCafStream<R>>, channel: usize) -> Result<Self, IoError> {
+        let info = shared.info();
         if channel >= info.num_channels {
             return Err(IoError::InvalidConfig(format!(
                 "CAF channel {channel} out of range ({} channels)",
@@ -295,39 +381,72 @@ impl<R: Read + Seek + Send> AudioSource for CafChannelSource<R> {
         self.total_frames
     }
 
-    fn read_frames(&mut self, frame_offset: u64, out: &mut [f64]) -> Result<usize, IoError> {
-        let mut guard = self
-            .shared
-            .lock()
-            .map_err(|_| IoError::InvalidConfig("CAF stream mutex poisoned".into()))?;
-        guard.read_channel_frames(self.channel, frame_offset, out)
+    fn read_frames(&self, frame_offset: u64, out: &mut [f64]) -> Result<usize, IoError> {
+        self.shared
+            .read_channel_frames(self.channel, frame_offset, out)
     }
 }
 
 #[inline]
-fn decode_sample(bytes: &[u8], is_float: bool, bits: u32, is_le: bool) -> f64 {
-    match (is_float, bits, is_le) {
-        (false, 16, true) => i16::from_le_bytes([bytes[0], bytes[1]]) as f64 / 32_768.0,
-        (false, 16, false) => i16::from_be_bytes([bytes[0], bytes[1]]) as f64 / 32_768.0,
-        (false, 24, true) => {
-            let raw = (bytes[0] as i32) | ((bytes[1] as i32) << 8) | ((bytes[2] as i32) << 16);
-            ((raw << 8) >> 8) as f64 / 8_388_608.0
+fn deinterleave_with<F>(
+    raw: &[u8],
+    info: &CafInfo,
+    avail: usize,
+    planar: &mut [Vec<f64>],
+    decode: F,
+) where
+    F: Fn(&[u8]) -> f64,
+{
+    let n_ch = info.num_channels;
+    let bps = info.bytes_per_frame / n_ch;
+    for f in 0..avail {
+        let frame_base = f * info.bytes_per_frame;
+        for (ch, ch_buf) in planar.iter_mut().enumerate().take(n_ch) {
+            let s_base = frame_base + ch * bps;
+            ch_buf[f] = decode(&raw[s_base..s_base + bps]);
         }
-        (false, 24, false) => {
-            let raw = ((bytes[0] as i32) << 16) | ((bytes[1] as i32) << 8) | (bytes[2] as i32);
-            ((raw << 8) >> 8) as f64 / 8_388_608.0
+    }
+}
+
+fn decode_interleaved_to_planar(raw: &[u8], info: &CafInfo, avail: usize, planar: &mut [Vec<f64>]) {
+    match (info.is_float, info.bits_per_channel, info.is_little_endian) {
+        (false, 16, true) => deinterleave_with(raw, info, avail, planar, |b| {
+            i16::from_le_bytes([b[0], b[1]]) as f64 / 32_768.0
+        }),
+        (false, 16, false) => deinterleave_with(raw, info, avail, planar, |b| {
+            i16::from_be_bytes([b[0], b[1]]) as f64 / 32_768.0
+        }),
+        (false, 24, true) => deinterleave_with(raw, info, avail, planar, |b| {
+            let raw_s = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
+            ((raw_s << 8) >> 8) as f64 / 8_388_608.0
+        }),
+        (false, 24, false) => deinterleave_with(raw, info, avail, planar, |b| {
+            let raw_s = ((b[0] as i32) << 16) | ((b[1] as i32) << 8) | (b[2] as i32);
+            ((raw_s << 8) >> 8) as f64 / 8_388_608.0
+        }),
+        (false, 32, true) => deinterleave_with(raw, info, avail, planar, |b| {
+            i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64 / 2_147_483_648.0
+        }),
+        (false, 32, false) => deinterleave_with(raw, info, avail, planar, |b| {
+            i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64 / 2_147_483_648.0
+        }),
+        (true, 32, true) => deinterleave_with(raw, info, avail, planar, |b| {
+            f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64
+        }),
+        (true, 32, false) => deinterleave_with(raw, info, avail, planar, |b| {
+            f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64
+        }),
+        (true, 64, true) => deinterleave_with(raw, info, avail, planar, |b| {
+            f64::from_le_bytes(b[0..8].try_into().unwrap())
+        }),
+        (true, 64, false) => deinterleave_with(raw, info, avail, planar, |b| {
+            f64::from_be_bytes(b[0..8].try_into().unwrap())
+        }),
+        _ => {
+            for ch_buf in planar.iter_mut().take(info.num_channels) {
+                ch_buf[..avail].fill(0.0);
+            }
         }
-        (false, 32, true) => {
-            i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64 / 2_147_483_648.0
-        }
-        (false, 32, false) => {
-            i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64 / 2_147_483_648.0
-        }
-        (true, 32, true) => f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64,
-        (true, 32, false) => f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64,
-        (true, 64, true) => f64::from_le_bytes(bytes[0..8].try_into().unwrap()),
-        (true, 64, false) => f64::from_be_bytes(bytes[0..8].try_into().unwrap()),
-        _ => 0.0,
     }
 }
 
@@ -397,8 +516,8 @@ mod tests {
         }
         let caf_le = build_test_caf(48_000, 2, 24, false, true, true, &le_pcm);
         let shared = SharedCafStream::from_reader(Cursor::new(caf_le)).unwrap();
-        let mut ch0 = CafChannelSource::new(Arc::clone(&shared), 0).unwrap();
-        let mut ch1 = CafChannelSource::new(shared, 1).unwrap();
+        let ch0 = CafChannelSource::new(Arc::clone(&shared), 0).unwrap();
+        let ch1 = CafChannelSource::new(shared, 1).unwrap();
         assert_eq!(ch0.total_frames(), 2);
 
         let mut buf0 = [0.0; 4];
@@ -415,7 +534,7 @@ mod tests {
         let b = s_pos_half.to_be_bytes();
         let caf_be = build_test_caf(48_000, 1, 24, false, false, false, &b[1..4]);
         let shared_be = SharedCafStream::from_reader(Cursor::new(caf_be)).unwrap();
-        let mut src_be = CafChannelSource::new(shared_be, 0).unwrap();
+        let src_be = CafChannelSource::new(shared_be, 0).unwrap();
         let mut out_be = [0.0; 1];
         src_be.read_frames(0, &mut out_be).unwrap();
         assert_relative_eq!(out_be[0], 0.5, epsilon = 1e-6);
@@ -429,11 +548,53 @@ mod tests {
         }
         let caf = build_test_caf(96_000, 1, 32, true, true, false, &pcm);
         let shared = SharedCafStream::from_reader(Cursor::new(caf)).unwrap();
-        assert_eq!(shared.lock().unwrap().info().sample_rate, 96_000);
-        let mut src = CafChannelSource::new(shared, 0).unwrap();
+        assert_eq!(shared.info().sample_rate, 96_000);
+        let src = CafChannelSource::new(shared, 0).unwrap();
         let mut out = [0.0; 2];
         src.read_frames(0, &mut out).unwrap();
         assert_relative_eq!(out[0], -0.75, epsilon = 1e-7);
         assert_relative_eq!(out[1], 0.125, epsilon = 1e-7);
+    }
+
+    #[test]
+    fn concurrent_multi_block_reads_across_threads_are_exact() {
+        let total_frames = CACHE_BLOCK_FRAMES * 3 + 137;
+        let mut pcm = Vec::with_capacity(total_frames * 2 * 4);
+        for f in 0..total_frames {
+            let s0 = ((f as f32) * 0.0001).sin();
+            let s1 = ((f as f32) * 0.0002).cos();
+            pcm.extend_from_slice(&s0.to_le_bytes());
+            pcm.extend_from_slice(&s1.to_le_bytes());
+        }
+        let caf = build_test_caf(48_000, 2, 32, true, true, false, &pcm);
+        let shared = SharedCafStream::from_reader(Cursor::new(caf)).unwrap();
+        let src0 = CafChannelSource::new(Arc::clone(&shared), 0).unwrap();
+        let src1 = CafChannelSource::new(shared, 1).unwrap();
+
+        std::thread::scope(|scope| {
+            let offsets = [0u64, 4096, 8192, 12_288, 3000];
+            let mut handles = Vec::new();
+            for &off in &offsets {
+                let s0 = &src0;
+                let s1 = &src1;
+                handles.push(scope.spawn(move || {
+                    let mut b0 = vec![0.0_f64; 2000];
+                    let mut b1 = vec![0.0_f64; 2000];
+                    let n0 = s0.read_frames(off, &mut b0).unwrap();
+                    let n1 = s1.read_frames(off, &mut b1).unwrap();
+                    assert_eq!(n0, n1);
+                    for i in 0..n0 {
+                        let f = off as usize + i;
+                        let exp0 = ((f as f32) * 0.0001).sin() as f64;
+                        let exp1 = ((f as f32) * 0.0002).cos() as f64;
+                        assert_eq!(b0[i].to_bits(), exp0.to_bits());
+                        assert_eq!(b1[i].to_bits(), exp1.to_bits());
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
     }
 }

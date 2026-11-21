@@ -50,6 +50,19 @@ pub fn accumulate_linear_ramp_simd(
     bus: &mut PcmBus,
     n_frames: usize,
 ) {
+    accumulate_linear_ramp_simd_at(arch, mono, gains0, gains1, bus, 0, n_frames);
+}
+
+/// Runtime-dispatched `pulp` SIMD linear gain-ramp accumulation starting at `bus_offset`.
+pub fn accumulate_linear_ramp_simd_at(
+    arch: Arch,
+    mono: &[f64],
+    gains0: &[f64],
+    gains1: &[f64],
+    bus: &mut PcmBus,
+    bus_offset: usize,
+    n_frames: usize,
+) {
     if n_frames == 0 {
         return;
     }
@@ -58,6 +71,7 @@ pub fn accumulate_linear_ramp_simd(
         gains0,
         gains1,
         channels: bus.channels_mut(),
+        bus_offset,
         n_frames,
     });
 }
@@ -67,6 +81,7 @@ struct AccumulateLinearRamp<'a> {
     gains0: &'a [f64],
     gains1: &'a [f64],
     channels: &'a mut [Vec<f64>],
+    bus_offset: usize,
     n_frames: usize,
 }
 
@@ -87,7 +102,7 @@ impl WithSimd for AccumulateLinearRamp<'_> {
             if g0 == 0.0 && g1 == 0.0 {
                 continue;
             }
-            let dst = &mut ch_buf[..self.n_frames];
+            let dst = &mut ch_buf[self.bus_offset..self.bus_offset + self.n_frames];
             let (dst_v, _) = S::as_mut_simd_f64s(dst);
             let common_vecs = src_v.len().min(dst_v.len());
             let simd_frames = common_vecs * lanes;

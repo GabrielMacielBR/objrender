@@ -198,7 +198,7 @@ fn bench_render_scene(c: &mut Criterion) {
     let layout = SpeakerLayout::layout_7_1_4();
     let vbap = VbapRenderer::build(&layout).unwrap();
     let sr = 48_000u32;
-    let total_frames = 48_000u64;
+    let total_frames = 96_000u64;
 
     let mut builder = SceneBuilder::new(sr, total_frames);
     for idx in 0..16u32 {
@@ -259,19 +259,25 @@ fn bench_render_scene(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("render_scene_7_1_4_16obj");
     group.throughput(Throughput::Elements(total_frames));
-    group.bench_function("1s_48khz_null_sink", |b| {
-        b.iter(|| {
-            let report = render_scene(
-                &mut scene,
-                &layout,
-                &vbap,
-                RenderConfig::default(),
-                Box::new(NullWriter::default()),
-            )
-            .unwrap();
-            black_box(report.frames_rendered);
+    for &(label, threads) in &[("1_thread", 1usize), ("auto_threads", 0usize)] {
+        group.bench_function(BenchmarkId::new("2s_48khz_null_sink", label), |b| {
+            let cfg = RenderConfig {
+                threads,
+                ..RenderConfig::default()
+            };
+            b.iter(|| {
+                let report = render_scene(
+                    &mut scene,
+                    &layout,
+                    &vbap,
+                    cfg,
+                    Box::new(NullWriter::default()),
+                )
+                .unwrap();
+                black_box(report.frames_rendered);
+            });
         });
-    });
+    }
     group.finish();
 }
 

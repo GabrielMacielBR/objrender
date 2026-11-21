@@ -473,6 +473,7 @@ dependencies = [
  "hound",
  "proptest",
  "pulp",
+ "rayon",
  "serde",
  "serde_yaml_ng",
  "thiserror",

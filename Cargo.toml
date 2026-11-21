@@ -8,6 +8,7 @@ repository = "https://github.com/GabrielMacielBR/objrender"
 
 [dependencies]
 pulp = { version = "0.22", features = ["x86-v4"] }
+rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml_ng = "0.10"
 thiserror = "2"

@@ -78,7 +78,7 @@ pub fn eval_interval(
     (start_state, end_state)
 }
 
-fn eval_left_limit(obj: &AudioObject, frame: u64) -> ObjectState {
+pub fn eval_left_limit(obj: &AudioObject, frame: u64) -> ObjectState {
     let kfs = &obj.keyframes;
     if kfs.is_empty() {
         return ObjectState::initial(obj);
@@ -133,6 +133,26 @@ pub fn next_discontinuity_in(
     obj.keyframes[start..]
         .iter()
         .take_while(|k| k.frame < end_exclusive)
+        .find(|k| k.discontinuous)
+        .map(|k| k.frame)
+}
+
+/// Finds the latest discontinuous keyframe inside `[min_frame_inclusive, end_exclusive)`.
+pub fn last_discontinuity_in(
+    obj: &AudioObject,
+    min_frame_inclusive: u64,
+    end_exclusive: u64,
+) -> Option<u64> {
+    if end_exclusive <= min_frame_inclusive {
+        return None;
+    }
+    let start = obj
+        .keyframes
+        .partition_point(|k| k.frame < min_frame_inclusive);
+    let end = obj.keyframes.partition_point(|k| k.frame < end_exclusive);
+    obj.keyframes[start..end]
+        .iter()
+        .rev()
         .find(|k| k.discontinuous)
         .map(|k| k.frame)
 }
@@ -273,6 +293,10 @@ mod tests {
         assert!(!is_discontinuous_at(&obj, 100));
         assert_eq!(next_discontinuity_in(&obj, 150, 250), Some(200));
         assert_eq!(next_discontinuity_in(&obj, 200, 250), None);
+        assert_eq!(last_discontinuity_in(&obj, 150, 200), None);
+        assert_eq!(last_discontinuity_in(&obj, 200, 250), Some(200));
+        assert_eq!(last_discontinuity_in(&obj, 150, 250), Some(200));
+        assert_eq!(last_discontinuity_in(&obj, 250, 250), None);
     }
 
     #[test]

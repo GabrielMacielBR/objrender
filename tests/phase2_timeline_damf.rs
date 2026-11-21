@@ -203,6 +203,7 @@ fn discontinuous_teleport_applies_hann_crossfade_anti_click() {
             crossfade_frames: 128,
             clipping: ClippingPolicy::PassThrough,
             lfe_policy: LfePolicy::DropIfAbsent,
+            ..RenderConfig::default()
         },
         Box::new(
             WaveWriter::create(
@@ -223,6 +224,7 @@ fn discontinuous_teleport_applies_hann_crossfade_anti_click() {
             crossfade_frames: 0,
             clipping: ClippingPolicy::PassThrough,
             lfe_policy: LfePolicy::DropIfAbsent,
+            ..RenderConfig::default()
         },
         Box::new(
             WaveWriter::create(
@@ -365,6 +367,7 @@ events:
             crossfade_frames: 64,
             clipping: ClippingPolicy::PassThrough,
             lfe_policy: LfePolicy::DropIfAbsent,
+            ..RenderConfig::default()
         },
         Box::new(
             WaveWriter::create(
@@ -555,6 +558,7 @@ events:
             crossfade_frames: 0,
             clipping: ClippingPolicy::PassThrough,
             lfe_policy: LfePolicy::DropIfAbsent,
+            ..RenderConfig::default()
         },
         Box::new(
             WaveWriter::create(

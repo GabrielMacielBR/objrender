@@ -127,6 +127,7 @@ fn render_pass_through_origin(
             crossfade_frames: 0,
             clipping: ClippingPolicy::PassThrough,
             lfe_policy: LfePolicy::DropIfAbsent,
+            ..RenderConfig::default()
         },
         Box::new(Capture(
             Arc::clone(&captured),

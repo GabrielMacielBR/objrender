@@ -41,13 +41,14 @@ struct CliArgs {
     normalize_peak: Option<f64>,
     lfe_policy: LfePolicy,
     crossfade_frames: usize,
+    threads: usize,
     format: SampleFormat,
     output: PathBuf,
 }
 
 fn print_usage() {
     eprintln!(
-        "objrender — Offline 3D object-based spatial audio renderer (Phase 3)
+        "objrender — Offline 3D object-based spatial audio renderer (Phase 5)
 
 USAGE:
   objrender [OPTIONS]
@@ -75,6 +76,7 @@ OPTIONS:
   --normalize-peak <dbfs>      Two-pass global peak normalization target in dBFS (<= 0.0)
   --lfe-policy <policy>        Missing-LFE policy: drop (default), folddown[:db] (default -3.0 dB)
   --crossfade-frames <n>       Anti-click Hann crossfade frames on jumps [default: 128]
+  --threads <n>                Worker threads (0 = auto via Rayon, 1 = single-threaded) [default: 0]
   --format <f32|f64>           Output sample format [default: f32]
   --output <path.wav>          Output WAV/RF64 file path [default: render.wav]
   -h, --help                   Print help"
@@ -105,6 +107,7 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
         normalize_peak: None,
         lfe_policy: LfePolicy::DropIfAbsent,
         crossfade_frames: 128,
+        threads: 0,
         format: SampleFormat::Float32,
         output: PathBuf::from("render.wav"),
     };
@@ -185,6 +188,7 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
             "--crossfade-frames" => {
                 cfg.crossfade_frames = parse_num(&next_val(&mut args, &arg)?, &arg)?
             }
+            "--threads" => cfg.threads = parse_num(&next_val(&mut args, &arg)?, &arg)?,
             "--format" => {
                 let v = next_val(&mut args, &arg)?;
                 cfg.format = match v.to_ascii_lowercase().as_str() {
@@ -380,6 +384,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             crossfade_frames: args.crossfade_frames,
             clipping,
             lfe_policy: args.lfe_policy,
+            threads: args.threads,
         },
         Box::new(writer),
     )?;

@@ -41,11 +41,11 @@ pub struct Keyframe {
 }
 
 /// Decouples in-memory test signals from disk-streamed mono PCM tracks.
-pub trait AudioSource: Send {
+pub trait AudioSource: Send + Sync {
     fn total_frames(&self) -> u64;
 
     /// Reads up to `out.len()` mono samples starting at `frame_offset`, zero-padding any tail.
-    fn read_frames(&mut self, frame_offset: u64, out: &mut [f64]) -> Result<usize, IoError>;
+    fn read_frames(&self, frame_offset: u64, out: &mut [f64]) -> Result<usize, IoError>;
 }
 
 /// Simple in-memory mono PCM sample source.
@@ -64,7 +64,7 @@ impl AudioSource for InMemorySource {
         self.samples.len() as u64
     }
 
-    fn read_frames(&mut self, frame_offset: u64, out: &mut [f64]) -> Result<usize, IoError> {
+    fn read_frames(&self, frame_offset: u64, out: &mut [f64]) -> Result<usize, IoError> {
         out.fill(0.0);
         let start = frame_offset as usize;
         if start >= self.samples.len() {
@@ -100,7 +100,7 @@ impl AudioSource for SineSource {
         self.total_frames
     }
 
-    fn read_frames(&mut self, frame_offset: u64, out: &mut [f64]) -> Result<usize, IoError> {
+    fn read_frames(&self, frame_offset: u64, out: &mut [f64]) -> Result<usize, IoError> {
         out.fill(0.0);
         if frame_offset >= self.total_frames {
             return Ok(0);
@@ -137,7 +137,7 @@ impl AudioSource for ImpulseSource {
         self.total_frames
     }
 
-    fn read_frames(&mut self, frame_offset: u64, out: &mut [f64]) -> Result<usize, IoError> {
+    fn read_frames(&self, frame_offset: u64, out: &mut [f64]) -> Result<usize, IoError> {
         out.fill(0.0);
         if frame_offset >= self.total_frames {
             return Ok(0);
