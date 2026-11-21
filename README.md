@@ -1,32 +1,254 @@
 # objrender
 
-An open-source, specialized **offline 3D object-based spatial audio renderer** written in Rust.
+An open-source, offline 3D object-based spatial audio renderer written in safe Rust (`#![forbid(unsafe_code)]`).
 
-> **Status: Phase 2 Implemented (Timeline, Motion & DAMF/CAF Importer)**
-> Supports moving 3D objects (`Linear` / `Spherical` SLERP / `Step`), per-sample linear gain ramping, Hann discontinuity crossfades, and decoded `truehdd`/`harletty` DAMF master sets (`.atmos` + `.atmos.metadata` + `.atmos.audio` CAF) rendered to arbitrary layouts as WAV/RF64.
->
-> Quick CLI examples:
-> ```sh
-> # Render a decoded truehdd/harletty DAMF bundle to 7.1.4 WAV
-> cargo run -- --damf movie.atmos --layout 7.1.4 --output rendered_7_1_4.wav
->
-> # Render a moving test sine wave orbiting from Left (+90°) to Right/Top (-90°, +45°)
-> cargo run -- --layout 7.1.4 --az 90 --el 0 --pan-to -90,45 --duration 2.0 --output orbit.wav
-> ```
+> **Status: Phases 1–5 Complete**
+> Production-ready offline rendering from decoded `truehdd` / `harletty` DAMF master sets (`.atmos` + `.atmos.metadata` + `.atmos.audio` CAF) or synthetic scenes onto arbitrary 1D/2D/3D speaker layouts, accelerated by runtime-dispatched SIMD (`pulp`) and deterministic `rayon` multi-threading, exporting `f32`/`f64` WAV / RF64 (`>4 GiB`).
 
 ---
 
-## Motivation
+## Features
 
-Open-source decoders for object-based surround bitstreams (such as `truehdd` and `harletty`) make it possible to extract discrete audio objects and OAMD/DAMF spatial metadata (CAF audio + ETSI TS 103 420 metadata), yet few open-source tools exist to perform clean offline rendering of those objects onto **arbitrary speaker setups** (from Stereo and 5.1.4 up to 9.1.6 or custom speaker geometries) as standard multichannel **WAV / RF64** files.
-
-`objrender` fills that gap with a lean, offline-first renderer built in safe Rust.
+- **Pure-Rust 1D / 2D / 3D VBAP Spatializer**
+  - Exact 3D convex-hull triangulation with L2 energy conservation and LFE isolation.
+  - Spatial `width` spread (MDAP / directional diffusion) and omnidirectional `divergence` mixing.
+  - Smooth near-origin omnidirectional blending (`--near-origin-radius`, default `0.15`) to eliminate directional snapping near the listener center.
+  - Configurable out-of-hull elevation handling: `virtual-poles` (default), `blend[:pow]` (default power `12.0`), or `fade`.
+- **Sample-Accurate Timeline & Motion**
+  - Sorted keyframe tracks with `Linear`, `Spherical` (SLERP on unit directions + linear radius), and `Step` interpolation.
+  - Per-sample linear gain ramping and raised-cosine (Hann) anti-click crossfades across discontinuous keyframes (including across chunk boundaries).
+- **Arbitrary Speaker Layouts**
+  - 8 built-in presets: `mono` (`1.0`), `stereo` (`2.0`), `5.1`, `7.1`, `5.1.4`, `7.1.4`, `7.1.6`, `9.1.6`.
+  - Selectable surround ordering: `--channel-order wav` (default `WAVE_FORMAT_EXTENSIBLE`) or `--channel-order smpte` (`Lss`/`Rss` before `Lrs`/`Rrs`).
+  - Custom arbitrary speaker setups loaded from TOML (`--layout-file`) in spherical (`azimuth_deg`, `elevation_deg`, `radius`) or Cartesian (`x`, `y`, `z`) coordinates.
+- **Mixing & Streaming Output**
+  - Clipping policies: pass-through, static headroom attenuation (`--headroom-db`), or exact two-pass global peak normalization (`--normalize-peak`).
+  - Missing-LFE routing policy: `drop` (default) or `folddown[:db]` (default `-3.0 dB`).
+  - Streaming IEEE float (`f32` / `f64`) WAV writer with automatic O(1) RIFF → RF64 (`ds64`) promotion above 4 GiB.
+  - Full `truehdd` / `harletty` DAMF + 16/24/32-bit PCM & 32/64-bit float CAF support (including `EAC3-JOC` core channel skipping and Dolby room-cube spherical projection).
+- **SIMD & Deterministic Parallelism**
+  - Runtime-dispatched SIMD kernels via [`pulp`](https://crates.io/crates/pulp) with `x86-v4` enabled (AVX-512, AVX2+FMA, SSE, NEON, or scalar fallback) for ramp accumulation, peak/RMS metering, and tiled PCM interleaving.
+  - Lock-split, recycled multi-slot CAF decoding cache paired with `rayon` chunked parallel rendering (`--threads`).
+  - Guaranteed **bit-for-bit identical** output across thread counts (`--threads 1` vs `--threads 0`).
 
 ---
 
-## High-Level Architecture
+## Building
 
-The rendering core is strictly decoupled from any input format. Format-specific importers translate decoded streams into a generic 3D object-based `Scene` representation:
+Requires a Rust toolchain supporting **Edition 2024**.
+
+```sh
+git clone https://github.com/GabrielMacielBR/objrender.git
+cd objrender
+cargo build --release
+```
+
+The compiled binary will be located at `./target/release/objrender`.
+
+---
+
+## Quick Usage
+
+### 1. Render a Decoded DAMF Master Set
+
+If you have a Dolby Atmos stream (TrueHD or E-AC-3 JOC), first decode it to a DAMF master set using `truehdd` or `harletty` + `ffmpeg`, then render onto your target speaker layout:
+
+```sh
+# Decode E-AC-3 JOC audio and render DAMF bundle with harletty (example)
+ffmpeg -i movie.mp4 -vn -c:a copy audio.eac3
+harletty decode --output-path damf_out/ audio.eac3
+
+# Default render to 7.1.4 WAV (auto threads, 32-bit float)
+./target/release/objrender --damf damf_out/master.atmos --layout 7.1.4 --output render_7_1_4.wav
+
+# Two-pass global peak normalization to -1.0 dBFS with SMPTE channel order (Lss/Rss before Lrs/Rrs)
+./target/release/objrender \
+  --damf damf_out/master.atmos \
+  --layout 7.1.4 \
+  --channel-order smpte \
+  --normalize-peak -1.0 \
+  --output render_smpte_norm.wav
+
+# 64-bit float output for 9.1.6 using 4 worker threads and folded LFE (-3 dB) if layout lacks LFE
+./target/release/objrender \
+  --damf damf_out/master.atmos \
+  --layout 9.1.6 \
+  --format f64 \
+  --threads 4 \
+  --lfe-policy folddown:-3.0 \
+  --output render_9_1_6.wav
+```
+
+### 2. Render Synthetic Test Signals
+
+```sh
+# Orbiting 1 kHz sine wave from Left (+90 deg) to Right/Top (-90 deg, +45 deg) over 2 seconds
+cargo run --release -- \
+  --layout 7.1.4 \
+  --az 90 --el 0 \
+  --pan-to -90,45 \
+  --interp spherical \
+  --duration 2.0 \
+  --output orbit.wav
+
+# Static object placed using normalized [0,1]x[0,1]x[-1,1] DAMF room-cube coordinates with width/divergence
+cargo run --release -- \
+  --layout 5.1.4 \
+  --damf-pos 0.25,0.25,0.5 \
+  --width 0.3 --divergence 0.15 \
+  --output cube_test.wav
+```
+
+### 3. Custom TOML Speaker Layout
+
+Coordinate convention: `+X` = Right, `+Y` = Front, `+Z` = Up (`azimuth = 0°` Front, `+90°` Left, `-90°` Right; `elevation = +90°` Zenith). Each speaker specifies either `(azimuth_deg, elevation_deg[, radius])` or `(x, y, z)`.
+
+```toml
+name = "custom-quad-plus-top"
+
+[[speakers]]
+label = "FL"
+azimuth_deg = 35.0
+elevation_deg = 0.0
+
+[[speakers]]
+label = "FR"
+azimuth_deg = -35.0
+elevation_deg = 0.0
+
+[[speakers]]
+label = "RL"
+azimuth_deg = 125.0
+elevation_deg = 0.0
+
+[[speakers]]
+label = "RR"
+azimuth_deg = -125.0
+elevation_deg = 0.0
+
+[[speakers]]
+label = "LFE"
+role = "lfe"
+x = 0.0
+y = 0.0
+z = 0.0
+
+[[speakers]]
+label = "TOP"
+azimuth_deg = 0.0
+elevation_deg = 85.0
+radius = 1.0
+```
+
+```sh
+./target/release/objrender --damf damf_out/master.atmos --layout-file custom.toml --output custom.wav
+```
+
+---
+
+## CLI Options Reference
+
+| Flag | Description | Default |
+| :--- | :--- | :--- |
+| `--damf <path.atmos>` | Path to decoded `truehdd` / `harletty` DAMF manifest | Synthetic test sine |
+| `--layout <name>` | Speaker preset (`mono`, `stereo`, `5.1`, `7.1`, `5.1.4`, `7.1.4`, `7.1.6`, `9.1.6`) | `7.1.4` |
+| `--layout-file <path>` | Custom TOML speaker layout file (overrides `--layout`) | None |
+| `--channel-order <order>` | Multichannel order: `wav` or `smpte` (`Lss`/`Rss` before `Lrs`/`Rrs`) | `wav` |
+| `--az <deg>` | Synthetic object initial azimuth in degrees | `0.0` |
+| `--el <deg>` | Synthetic object initial elevation in degrees | `0.0` |
+| `--radius <r>` | Synthetic object distance radius | `1.0` |
+| `--pan-to <az,el>` | Pan synthetic sine wave from `(--az,--el)` to `(az,el)` over `--duration` | None |
+| `--interp <mode>` | Trajectory interpolation for `--pan-to`: `linear`, `spherical`, `step` | `spherical` |
+| `--damf-pos <x,y,z>` | Synthetic static DAMF room-cube coords (`x,y` in `[0,1]`, `z` in `[-1,1]`) | None |
+| `--width <0..1>` | Spatial spread width for synthetic object | `0.0` |
+| `--divergence <0..1>` | Omnidirectional divergence diffusion for synthetic object | `0.0` |
+| `--near-origin-radius <r>` | Smooth omnidirectional blend radius near origin (`0` disables) | `0.15` |
+| `--out-of-hull <mode>` | Out-of-hull behavior: `virtual-poles`, `blend[:pow]`, or `fade` | `virtual-poles` |
+| `--gain <linear>` | Synthetic object linear gain | `1.0` |
+| `--freq <hz>` | Synthetic sine wave frequency in Hz | `1000.0` |
+| `--duration <sec>` | Synthetic signal duration in seconds | `1.0` |
+| `--sample-rate <hz>` | Synthetic signal sample rate in Hz | `48000` |
+| `--headroom-db <db>` | Static output attenuation in dB (mutually exclusive with `--normalize-peak`) | None |
+| `--normalize-peak <dbfs>` | Two-pass global peak normalization target in dBFS (`<= 0.0`) | None |
+| `--lfe-policy <policy>` | Missing-LFE behavior: `drop` or `folddown[:db]` (`-3.0` default dB) | `drop` |
+| `--crossfade-frames <n>` | Anti-click Hann crossfade length in frames on discontinuities (`0` disables) | `128` |
+| `--threads <n>` | Worker threads (`0` = auto via Rayon, `1` = single-threaded) | `0` |
+| `--format <f32\|f64>` | Output IEEE float sample format | `f32` |
+| `--output <path.wav>` | Output WAV / RF64 file path | `render.wav` |
+| `-h`, `--help` | Print CLI help | — |
+
+---
+
+## Built-in Speaker Presets & Channel Ordering
+
+| Preset | Aliases | Channels | Channel Labels (`wav` order) | `WAVE_FORMAT_EXTENSIBLE` Mask |
+| :--- | :--- | :---: | :--- | :--- |
+| `mono` | `1.0` | 1 | `C` | `0x0004` |
+| `stereo` | `2.0` | 2 | `L, R` | `0x0003` |
+| `5.1` | — | 6 | `L, R, C, LFE, Ls, Rs` | `0x003F` |
+| `7.1` | — | 8 | `L, R, C, LFE, Lrs, Rrs, Lss, Rss` | `0x063F` |
+| `5.1.4` | — | 10 | `L, R, C, LFE, Ls, Rs, Ltf, Rtf, Ltr, Rtr` | `0xD03F` |
+| `7.1.4` | — | 12 | `L, R, C, LFE, Lrs, Rrs, Lss, Rss, Ltf, Rtf, Ltr, Rtr` | `0x2D63F` |
+| `7.1.6` | — | 14 | `L, R, C, LFE, Lrs, Rrs, Lss, Rss, Ltf, Rtf, Ltm, Rtm, Ltr, Rtr` | `0` |
+| `9.1.6` | — | 16 | `L, R, C, LFE, Lw, Rw, Lss, Rss, Lrs, Rrs, Ltf, Rtf, Ltm, Rtm, Ltr, Rtr` | `0` |
+
+With `--channel-order smpte`, `7.1`, `7.1.4`, and `7.1.6` place side surrounds (`Lss`, `Rss`) before rear surrounds (`Lrs`, `Rrs`), matching cinema/SMPTE DAW conventions (and set `dwChannelMask = 0` so Microsoft WAV parsers do not misinterpret reordered surround bits).
+
+---
+
+## Library Usage
+
+`objrender` can also be used as a Rust crate:
+
+```rust
+use objrender::importers::SceneImporter;
+use objrender::importers::damf::DamfImporter;
+use objrender::io::{SampleFormat, WaveConfig, WaveWriter};
+use objrender::layout::{ChannelOrder, SpeakerLayout};
+use objrender::mixer::{ClippingPolicy, RenderConfig, render_scene};
+use objrender::renderer::VbapRenderer;
+
+fn render_damf_to_wav() -> Result<(), Box<dyn std::error::Error>> {
+    let layout = SpeakerLayout::preset_with_order("7.1.4", ChannelOrder::Wav).unwrap();
+    let mut scene = DamfImporter::new("master.atmos").import()?;
+    let spatializer = VbapRenderer::build(&layout)?;
+
+    let writer = WaveWriter::create(
+        "output_7_1_4.wav",
+        WaveConfig::new(
+            scene.sample_rate,
+            layout.speakers.len() as u16,
+            layout.channel_mask(),
+            SampleFormat::Float32,
+        ),
+    )?;
+
+    let report = render_scene(
+        &mut scene,
+        &layout,
+        &spatializer,
+        RenderConfig {
+            clipping: ClippingPolicy::TwoPassPeakNormalize { target_dbfs: -1.0 },
+            threads: 0, // auto via Rayon
+            ..RenderConfig::default()
+        },
+        Box::new(writer),
+    )?;
+
+    println!(
+        "Rendered {} frames (gain={:+.2} dB)",
+        report.frames_rendered,
+        report.applied_gain_db()
+    );
+    Ok(())
+}
+```
+
+---
+
+## Architecture & Core Design Principles
+
+The rendering engine is strictly decoupled from input container and metadata formats. Importers convert decoded streams into a format-agnostic `Scene` of `AudioObject` tracks and keyframe trajectories:
 
 ```text
   Decoded Streams (truehdd / harletty: DAMF/OAMD + CAF)   Future Formats (ADM / IAMF / MPEG-H)
@@ -41,43 +263,62 @@ The rendering core is strictly decoupled from any input format. Format-specific 
                               Scene (generic 3D AudioObjects + PCM)
                                                  │
                                                  ▼
-                                  Spatial Renderer (e.g., 3D VBAP)
+                                  Spatial Renderer (1D/2D/3D VBAP)
                                                  │
                                                  ▼
-                               Mixer (summation, headroom, clipping)
+                    Parallel Chunked Mixer (ramping, crossfade, LFE, SIMD)
                                                  │
                                                  ▼
-                                              PCM Bus
+                                    Planar f64 PCM Bus + Metering
                                                  │
                                                  ▼
-                                      Wave Writer (WAV / RF64)
+                                       Wave Writer (WAV / RF64)
 ```
+
+- **Format-Agnostic Core**: Core modules (`math`, `layout`, `scene`, `timeline`, `renderer`, `mixer`, `io`) never reference `importers`, `damf`, `caf`, or `serde_yaml`.
+- **Safe & Lean**: `#![forbid(unsafe_code)]` crate-wide across library and binary, without ECS/plugin/real-time DAW bloat.
+- **Further Reading**: Detailed design rules and subsystem specs are documented in [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) and [CLAUDE.md](./CLAUDE.md).
 
 ---
 
-## Core Design Principles
+## Testing & Benchmarks
 
-- **Format-Agnostic Core**: The rendering engine knows nothing about external container or metadata standards (`OAMD`/`DAMF`, `ADM`, `IAMF`, `MPEG-H`)—it operates purely on 3D audio objects, keyframes, and speaker geometry.
-- **Arbitrary Speaker Layouts**: No hardcoded channel counts or fixed speaker positions. Every speaker is modeled by its 3D geometric coordinates.
-- **Offline Specialization**: Built specifically for accurate, deterministic offline file rendering—not as a DAW, real-time media player, or generic audio framework.
-- **Lean, Safe Rust**: Prioritizes clarity, safety, performance, and maintainability without ECS, plugin systems, or unnecessary `unsafe`.
+Run the full verification suite and Criterion microbenchmarks:
+
+```sh
+# Format, strict linting, and all 42 unit/integration/property tests
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+
+# Criterion SIMD & full-scene render benchmarks
+cargo bench --bench dsp_kernels
+```
+
+### Measured Performance (AMD Ryzen 5 4600G — AVX2+FMA, 12 threads)
+
+- **Real Atmos stream** (208.03s / 9,985,536 frames @ 48 kHz, 16 objects, 21-ch 600 MiB CAF → 479 MB `7.1.4` `f32` WAV):
+  - **1-pass (`PassThrough`)**: `~2.17s` (`--threads 1`, `~96x` realtime) / `~2.25s` (`--threads 0`, disk read/write I/O bound)
+  - **2-pass (`--normalize-peak -1.0`)**: `~4.19s` (`--threads 1`) → **`~2.70s` (`--threads 0`, `~77x` realtime, `1.55x` speedup including full disk write)**
+  - **Determinism**: Bit-exact identical `SHA-256` output between `--threads 1` and `--threads 0` on both 1-pass and 2-pass renders.
+- **Synthetic 2s scene (`render_scene_7_1_4_16obj`, `NullWriter`)**: `33.1 ms` (`1_thread`) → `9.0 ms` (`auto_threads`, **`~3.68x` speedup**).
 
 ---
 
 ## Roadmap
 
-- **Phase 1 (MVP)**: `Scene` model, arbitrary speaker layouts, single static object rendering, WAV export.
-- **Phase 2**: Moving objects, keyframes, timeline interpolation & temporal smoothing.
-- **Phase 3**: Full 3D VBAP, energy normalization, object spread/width.
-- **Phase 4**: SIMD acceleration.
-- **Phase 5**: Multi-threaded offline parallelization.
-- **Phase 6**: RF64 (>4 GB) export, full format importer integration, advanced mixing/loudness controls.
+- [x] **Phase 1 (MVP)**: Format-agnostic `Scene`, arbitrary TOML & preset speaker layouts, 1D/2D/3D VBAP, WAV/RF64 (`>4 GiB`) export.
+- [x] **Phase 2**: Keyframe timeline (`Linear`, `Spherical` SLERP, `Step`), sample-accurate gain ramping, Hann discontinuity crossfades, and streaming DAMF/OAMD + CAF importer (`truehdd` & `harletty` `EAC3-JOC`).
+- [x] **Phase 3**: Smooth near-origin omnidirectional blending, omnidirectional `divergence`, out-of-hull modes (`virtual-poles`, `blend`, `fade`), LFE policies, headroom & two-pass global peak normalization.
+- [x] **Phase 4**: Runtime-dispatched SIMD mixing, metering, and interleaved WAV export via `pulp` (`x86-v4` / AVX-512 / AVX2+FMA / SSE / NEON / scalar) + Criterion benchmarks.
+- [x] **Phase 5**: Lock-split parallel CAF decoding, deterministic chunked `rayon` multi-threading (`--threads`), and bit-exact verification suite.
+- [ ] **Phase 6+**: Additional spatial formats (ADM BWF, IAMF, etc.), extended speaker layouts/virtualization, ITU-R BS.1770 integrated loudness normalization, and release packaging.
 
 ---
 
-## Development Guidelines
+## AI-Assisted Development
 
-Architectural rules, subsystem requirements, and design constraints are documented in [CLAUDE.md](./CLAUDE.md).
+Portions of this codebase, architecture documentation, tests, and benchmarks were drafted and iterated with **AI coding assistants** under human direction, design review, and validation. All core invariants and behaviors remain continuously verified via `#![forbid(unsafe_code)]`, strict `clippy` checks (`-D warnings`), automated unit/integration/property tests (including bit-exact determinism checks across thread counts), and real-world Atmos comparison renders against reference decoders/renderers.
 
 ---
 
@@ -89,4 +330,4 @@ Licensed under the **GNU General Public License v3.0 or later** (`GPL-3.0-or-lat
 
 ## Attribution & Independence Notice
 
-`objrender` is an independent open-source project implementing offline spatial audio rendering (VBAP, RF64, OAMD / ETSI TS 103 420, and ITU-R BS.2076 interoperability). Its pure-Rust 3D VBAP triangulation and panning core adapts modules from [Omniphony](https://github.com/mgth/Omniphony) (`GPL-3.0-or-later`), building upon the Spatial Audio Framework (`SAF`) / Archontis Politis / Leo McCormack / Ville Pulkki VBAP lineage. `objrender` is not affiliated with, endorsed by, or sponsored by any commercial vendor or standards organization.
+`objrender` is an independent open-source project implementing offline spatial audio rendering (VBAP, RF64, OAMD / ETSI TS 103 420, and ITU-R BS.2076 interoperability). Its pure-Rust 3D VBAP triangulation, panning, and room-cube projection modules adapt code from [Omniphony](https://github.com/mgth/Omniphony) (`GPL-3.0-or-later`), building upon the Spatial Audio Framework (`SAF`) / Archontis Politis / Leo McCormack / Ville Pulkki VBAP lineage. `objrender` is not affiliated with, endorsed by, or sponsored by any commercial vendor or standards organization.
