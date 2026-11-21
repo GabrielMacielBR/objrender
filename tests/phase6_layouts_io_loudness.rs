@@ -60,8 +60,9 @@ fn all_18_presets_build_vbap_and_route_key_directions() {
         }
     }
 
-    // Auro 10.1 zenith Voice of God (+90 deg elevation) routes cleanly to VoG (ch 10).
+    // Auro 10.1 zenith Voice of God (+90 deg elevation) routes cleanly to VoG.
     let auro = SpeakerLayout::preset("auro-10.1").unwrap();
+    let vog_idx = auro.speakers.iter().position(|s| s.label == "VoG").unwrap();
     let auro_vbap = VbapRenderer::build(&auro).unwrap();
     let mut auro_gains = vec![0.0_f64; 11];
     auro_vbap.compute_gains(
@@ -69,7 +70,7 @@ fn all_18_presets_build_vbap_and_route_key_directions() {
         SpatialParams::default(),
         &mut auro_gains,
     );
-    assert_relative_eq!(auro_gains[10], 1.0, epsilon = 1e-5);
+    assert_relative_eq!(auro_gains[vog_idx], 1.0, epsilon = 1e-5);
 
     // 5.1.2 and 7.1.2 route overhead (+-90 deg az, +45 deg el) to Ltm / Rtm.
     let l512 = SpeakerLayout::preset("5.1.2").unwrap();

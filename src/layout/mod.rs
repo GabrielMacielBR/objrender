@@ -78,8 +78,11 @@ const MASK_FC: u32 = 0x0000_0004;
 const MASK_LFE: u32 = 0x0000_0008;
 const MASK_BL: u32 = 0x0000_0010;
 const MASK_BR: u32 = 0x0000_0020;
+const MASK_FLC: u32 = 0x0000_0040;
+const MASK_FRC: u32 = 0x0000_0080;
 const MASK_SL: u32 = 0x0000_0200;
 const MASK_SR: u32 = 0x0000_0400;
+const MASK_TC: u32 = 0x0000_0800;
 const MASK_TFL: u32 = 0x0000_1000;
 const MASK_TFR: u32 = 0x0000_4000;
 const MASK_TBL: u32 = 0x0000_8000;
@@ -216,30 +219,57 @@ impl SpeakerLayout {
         Self::preset(name).map(|layout| layout.with_channel_order(order))
     }
 
-    /// Reorders surround channels according to `order`.
+    /// Reorders channels according to `order`.
     ///
-    /// Note: Under [`ChannelOrder::Smpte`], side surrounds (`Lss`/`Rss`) precede rear surrounds
-    /// (`Lrs`/`Rrs`), so [`Self::channel_mask`] naturally returns `0` rather than emitting a
-    /// contradictory `WAVE_FORMAT_EXTENSIBLE` channel bitmask.
+    /// Note: Under [`ChannelOrder::Smpte`], side/wide surrounds precede rear surrounds (`Lrs`/`Rrs`)
+    /// and Auro Voice-of-God (`VoG`) trails heights, so [`Self::channel_mask`] naturally returns `0`
+    /// rather than emitting a contradictory `WAVE_FORMAT_EXTENSIBLE` channel bitmask.
     pub fn with_channel_order(mut self, order: ChannelOrder) -> Self {
         match order {
             ChannelOrder::Wav => self,
             ChannelOrder::Smpte => {
-                let find = |label: &str| {
-                    self.speakers
+                let find = |speakers: &[Speaker], label: &str| {
+                    speakers
                         .iter()
                         .position(|s| s.label.eq_ignore_ascii_case(label))
                 };
-                if let (Some(lrs), Some(rrs), Some(lss), Some(rss)) =
-                    (find("Lrs"), find("Rrs"), find("Lss"), find("Rss"))
-                    && lrs < lss
+                if let (Some(lw), Some(rw), Some(lss), Some(rss), Some(lrs), Some(rrs)) = (
+                    find(&self.speakers, "Lw"),
+                    find(&self.speakers, "Rw"),
+                    find(&self.speakers, "Lss"),
+                    find(&self.speakers, "Rss"),
+                    find(&self.speakers, "Lrs"),
+                    find(&self.speakers, "Rrs"),
+                ) && lrs < lw
+                    && lw < lss
+                {
+                    let targets = [lrs, rrs, lw, rw, lss, rss];
+                    let orig = [lw, rw, lss, rss, lrs, rrs].map(|i| self.speakers[i].clone());
+                    for (slot, spk) in targets.into_iter().zip(orig) {
+                        self.speakers[slot] = spk;
+                    }
+                } else if let (Some(lrs), Some(rrs), Some(lss), Some(rss)) = (
+                    find(&self.speakers, "Lrs"),
+                    find(&self.speakers, "Rrs"),
+                    find(&self.speakers, "Lss"),
+                    find(&self.speakers, "Rss"),
+                ) && lrs < lss
                     && rrs < rss
                 {
                     self.speakers.swap(lrs, lss);
                     self.speakers.swap(rrs, rss);
-                    for (idx, spk) in self.speakers.iter_mut().enumerate() {
-                        spk.id = SpeakerId(idx);
-                    }
+                }
+
+                if let (Some(vog), Some(hrs)) =
+                    (find(&self.speakers, "VoG"), find(&self.speakers, "HRs"))
+                    && vog < hrs
+                {
+                    let spk = self.speakers.remove(vog);
+                    self.speakers.push(spk);
+                }
+
+                for (idx, spk) in self.speakers.iter_mut().enumerate() {
+                    spk.id = SpeakerId(idx);
                 }
                 self
             }
@@ -480,20 +510,20 @@ impl SpeakerLayout {
         Self::new(
             "9.1.4",
             vec![
-                sph(0, "L", 30.0, 0.0, None),
-                sph(1, "R", -30.0, 0.0, None),
-                sph(2, "C", 0.0, 0.0, None),
-                lfe(3, "LFE", None),
-                sph(4, "Lw", 60.0, 0.0, None),
-                sph(5, "Rw", -60.0, 0.0, None),
-                sph(6, "Lss", 90.0, 0.0, None),
-                sph(7, "Rss", -90.0, 0.0, None),
-                sph(8, "Lrs", 135.0, 0.0, None),
-                sph(9, "Rrs", -135.0, 0.0, None),
-                sph(10, "Ltf", 45.0, 45.0, None),
-                sph(11, "Rtf", -45.0, 45.0, None),
-                sph(12, "Ltr", 135.0, 45.0, None),
-                sph(13, "Rtr", -135.0, 45.0, None),
+                sph(0, "L", 30.0, 0.0, Some(MASK_FL)),
+                sph(1, "R", -30.0, 0.0, Some(MASK_FR)),
+                sph(2, "C", 0.0, 0.0, Some(MASK_FC)),
+                lfe(3, "LFE", Some(MASK_LFE)),
+                sph(4, "Lrs", 135.0, 0.0, Some(MASK_BL)),
+                sph(5, "Rrs", -135.0, 0.0, Some(MASK_BR)),
+                sph(6, "Lw", 60.0, 0.0, Some(MASK_FLC)),
+                sph(7, "Rw", -60.0, 0.0, Some(MASK_FRC)),
+                sph(8, "Lss", 90.0, 0.0, Some(MASK_SL)),
+                sph(9, "Rss", -90.0, 0.0, Some(MASK_SR)),
+                sph(10, "Ltf", 45.0, 45.0, Some(MASK_TFL)),
+                sph(11, "Rtf", -45.0, 45.0, Some(MASK_TFR)),
+                sph(12, "Ltr", 135.0, 45.0, Some(MASK_TBL)),
+                sph(13, "Rtr", -135.0, 45.0, Some(MASK_TBR)),
             ],
         )
         .expect("valid 9.1.4 preset")
@@ -507,12 +537,12 @@ impl SpeakerLayout {
                 sph(1, "R", -30.0, 0.0, None),
                 sph(2, "C", 0.0, 0.0, None),
                 lfe(3, "LFE", None),
-                sph(4, "Lw", 60.0, 0.0, None),
-                sph(5, "Rw", -60.0, 0.0, None),
-                sph(6, "Lss", 90.0, 0.0, None),
-                sph(7, "Rss", -90.0, 0.0, None),
-                sph(8, "Lrs", 135.0, 0.0, None),
-                sph(9, "Rrs", -135.0, 0.0, None),
+                sph(4, "Lrs", 135.0, 0.0, None),
+                sph(5, "Rrs", -135.0, 0.0, None),
+                sph(6, "Lw", 60.0, 0.0, None),
+                sph(7, "Rw", -60.0, 0.0, None),
+                sph(8, "Lss", 90.0, 0.0, None),
+                sph(9, "Rss", -90.0, 0.0, None),
                 sph(10, "Ltf", 45.0, 45.0, None),
                 sph(11, "Rtf", -45.0, 45.0, None),
                 sph(12, "Ltm", 90.0, 60.0, None),
@@ -528,17 +558,17 @@ impl SpeakerLayout {
         Self::new(
             "auro-10.1",
             vec![
-                sph(0, "L", 30.0, 0.0, None),
-                sph(1, "R", -30.0, 0.0, None),
-                sph(2, "C", 0.0, 0.0, None),
-                lfe(3, "LFE", None),
-                sph(4, "Ls", 110.0, 0.0, None),
-                sph(5, "Rs", -110.0, 0.0, None),
-                sph(6, "HL", 30.0, 30.0, None),
-                sph(7, "HR", -30.0, 30.0, None),
-                sph(8, "HLs", 110.0, 30.0, None),
-                sph(9, "HRs", -110.0, 30.0, None),
-                sph(10, "VoG", 0.0, 90.0, None),
+                sph(0, "L", 30.0, 0.0, Some(MASK_FL)),
+                sph(1, "R", -30.0, 0.0, Some(MASK_FR)),
+                sph(2, "C", 0.0, 0.0, Some(MASK_FC)),
+                lfe(3, "LFE", Some(MASK_LFE)),
+                sph(4, "Ls", 110.0, 0.0, Some(MASK_BL)),
+                sph(5, "Rs", -110.0, 0.0, Some(MASK_BR)),
+                sph(6, "VoG", 0.0, 90.0, Some(MASK_TC)),
+                sph(7, "HL", 30.0, 30.0, Some(MASK_TFL)),
+                sph(8, "HR", -30.0, 30.0, Some(MASK_TFR)),
+                sph(9, "HLs", 110.0, 30.0, Some(MASK_TBL)),
+                sph(10, "HRs", -110.0, 30.0, Some(MASK_TBR)),
             ],
         )
         .expect("valid auro-10.1 preset")
@@ -620,6 +650,10 @@ mod tests {
         assert_eq!(SpeakerLayout::layout_5_1_2().channel_mask(), 0x503F);
         assert_eq!(SpeakerLayout::layout_7_1_2().channel_mask(), 0x563F);
         assert_eq!(SpeakerLayout::layout_7_1_4().channel_mask(), 0x2_D63F);
+        assert_eq!(SpeakerLayout::layout_7_1_6().channel_mask(), 0);
+        assert_eq!(SpeakerLayout::layout_9_1_4().channel_mask(), 0x2_D6FF);
+        assert_eq!(SpeakerLayout::layout_9_1_6().channel_mask(), 0);
+        assert_eq!(SpeakerLayout::auro_10_1().channel_mask(), 0x2_D83F);
     }
 
     #[test]
@@ -723,5 +757,25 @@ mod tests {
         assert_eq!(wav_714.speakers[6].label, "Lss");
         assert_eq!(wav_714.speakers[7].label, "Rss");
         assert_eq!(wav_714.channel_mask(), 0x2_D63F);
+
+        let smpte_914 = SpeakerLayout::preset_with_order("9.1.4", ChannelOrder::Smpte).unwrap();
+        let labels_914: Vec<&str> = smpte_914.speakers.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(
+            labels_914,
+            [
+                "L", "R", "C", "LFE", "Lw", "Rw", "Lss", "Rss", "Lrs", "Rrs", "Ltf", "Rtf", "Ltr", "Rtr"
+            ]
+        );
+        assert_eq!(smpte_914.channel_mask(), 0);
+
+        let smpte_auro = SpeakerLayout::preset_with_order("auro-10.1", ChannelOrder::Smpte).unwrap();
+        let labels_auro: Vec<&str> = smpte_auro.speakers.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(
+            labels_auro,
+            [
+                "L", "R", "C", "LFE", "Ls", "Rs", "HL", "HR", "HLs", "HRs", "VoG"
+            ]
+        );
+        assert_eq!(smpte_auro.channel_mask(), 0);
     }
 }
