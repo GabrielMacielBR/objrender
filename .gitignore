@@ -1,0 +1,35 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+# Note: Once Cargo.toml is introduced, decide whether to track Cargo.lock
+# (recommended if objrender ships a CLI binary; ignored for pure library crates).
+
+# Criterion benchmark reports (if generated outside /target)
+/criterion/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Large decoded bitstreams and rendered audio outputs
+# Small synthetic/golden test fixtures can be tracked explicitly under tests/fixtures/
+*.wav
+*.rf64
+*.pcm
+*.raw
+*.caf
+*.thd
+*.mlp
+*.atmos
+*.atmos.audio
+*.atmos.metadata
+!tests/fixtures/**
