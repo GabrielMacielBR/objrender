@@ -77,17 +77,12 @@ Spatial Renderer → Mixer → PCM / Wave Writer
 
 ---
 
-## 4. Clean-Room & Legal Hygiene
+## 4. License & Reuse Policy
 
-### Reference Policy (Omniphony)
-- [Omniphony](https://github.com/mgth/Omniphony) may be consulted strictly as a **mathematical and conceptual reference** for:
-  - VBAP (Vector Base Amplitude Panning) geometry and gain calculation
-  - Geometric speaker modeling
-  - Spatial rendering math
-  - Arbitrary speaker layouts
-  - Energy distribution and normalization
-- **DO NOT** copy, port, or derive source code or software architecture from Omniphony (Omniphony is licensed under `GPL-3.0`, whereas `objrender` is clean-room dual-licensed under `MIT OR Apache-2.0`).
-- **DO NOT** reproduce Omniphony's complexity, runtime ABI/plugin bridges, real-time audio server integrations, or universal-engine abstractions.
+### Omniphony Reuse Policy (GPL-3.0-or-later)
+- `objrender` is licensed under **`GPL-3.0-or-later`** (matching [Omniphony](https://github.com/mgth/Omniphony)).
+- Selective reuse and adaptation of Omniphony's pure-Rust DSP, VBAP, and geometry modules (such as `convhull`, `vbap_native`, `ramp_strategy`, and distance/spread math) is explicitly encouraged, provided upstream copyright and `GPL-3.0-or-later` notices are preserved verbatim.
+- **DO NOT** reproduce Omniphony's architectural complexity: no runtime ABI/plugin bridges, real-time audio server integrations (PipeWire/ASIO/WASAPI), OSC servers, GUI studio, or universal-engine abstractions.
 
 ### Naming & Trademark Hygiene
 - Keep all project, crate, binary, module, and API identifiers grounded in neutral technical and open-standard terms (`objrender`, `importers::damf`, `OAMD`, `ADM`, `CAF`, `RF64`) rather than third-party consumer trademarks.

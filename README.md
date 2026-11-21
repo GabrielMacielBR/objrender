@@ -74,15 +74,10 @@ Architectural rules, subsystem requirements, and design constraints are document
 
 ## License
 
-Dual-licensed under either of:
-
-- MIT License ([LICENSE-MIT](./LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
-- Apache License, Version 2.0 ([LICENSE-APACHE](./LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
-
-at your option.
+Licensed under the **GNU General Public License v3.0 or later** (`GPL-3.0-or-later`, see [LICENSE](./LICENSE) or <https://www.gnu.org/licenses/gpl-3.0.html>).
 
 ---
 
-## Clean-Room & Independence Notice
+## Attribution & Independence Notice
 
-`objrender` is an independent clean-room open-source project implementing standard spatial audio math (VBAP, RF64, OAMD / ETSI TS 103 420, and ITU-R BS.2076 interoperability) under `MIT OR Apache-2.0`. It is not affiliated with, endorsed by, or sponsored by any commercial vendor or standards organization.
+`objrender` is an independent open-source project implementing offline spatial audio rendering (VBAP, RF64, OAMD / ETSI TS 103 420, and ITU-R BS.2076 interoperability). Its pure-Rust 3D VBAP triangulation and panning core adapts modules from [Omniphony](https://github.com/mgth/Omniphony) (`GPL-3.0-or-later`), building upon the Spatial Audio Framework (`SAF`) / Archontis Politis / Leo McCormack / Ville Pulkki VBAP lineage. `objrender` is not affiliated with, endorsed by, or sponsored by any commercial vendor or standards organization.

@@ -1,7 +1,7 @@
 # objrender — Architecture & Technical Design Specification
 
-> **Status:** Architecture Specification (Pre-Implementation Review)  
-> **License Target:** Dual `MIT OR Apache-2.0` (Clean-Room Implementation)
+> **Status:** Architecture Specification (Phase 1 MVP In Progress)  
+> **License:** `GPL-3.0-or-later` (see `LICENSE`)
 
 This document defines the complete software architecture, mathematical models, DSP algorithms, Rust data types, crate selections, phased implementation plan, verification strategy, and technical risks for **objrender**.
 
@@ -39,9 +39,9 @@ This document defines the complete software architecture, mathematical models, D
   - Operates **exclusively** on generic 3D audio objects, arbitrary speaker coordinates, timelines, and planar PCM buses.
   - **Core Invariant:** No file, struct, trait, enum, or function inside the rendering core may import from `src/importers/` or assume any format-specific metadata convention (`OAMD`/`DAMF`, `ADM`, `IAMF`, `MPEG-H`).
 
-### 1.2 Clean-Room & Naming Hygiene
+### 1.2 License, Omniphony Reuse & Naming Hygiene
 
-- **Omniphony Policy:** [Omniphony](https://github.com/mgth/Omniphony) (`GPL-3.0`) is used strictly as a **mathematical and conceptual reference** (VBAP geometry, virtual speaker closure, energy normalization, arbitrary layouts). No code, structs, or runtime plugin/server architecture may be copied or ported from Omniphony. All code in `objrender` is written clean-room under `MIT OR Apache-2.0`.
+- **Omniphony Reuse Policy (`GPL-3.0-or-later`):** `objrender` is licensed under `GPL-3.0-or-later` so it can selectively reuse and adapt battle-tested pure-Rust DSP/VBAP/geometry modules from [Omniphony](https://github.com/mgth/Omniphony) (`convhull`, `vbap_native` with ITU-R BS.2127 virtual poles, coplanar virtual face centres, 3D spread, and zero-allocation `Vbap3dScratch`), preserving upstream copyright and license headers. Real-time server backends, OSC, GUI studio, and plugin ABI bridge complexity from Omniphony are intentionally **not** reproduced.
 - **Naming & Trademark Hygiene:** Keep all project, crate, binary, module, and API identifiers grounded in neutral technical and open-standard terms (`objrender`, `importers::damf`, `OAMD`, `ADM`, `CAF`, `RF64`) rather than third-party consumer trademarks.
 - **Anti-Overengineering Constraints:** Built for a small team. No ECS, no runtime plugin systems, no ABI bridges, no DI containers, no service locators, and no generic "audio engine" frameworks.
 
@@ -267,12 +267,10 @@ Real speaker layouts are rarely closed spheres around the listener (for example,
   - Project directions onto the horizontal XY circle and sort speakers by azimuth $\theta \in (-\pi, \pi]$.
   - Form adjacent 2D speaker pairs $(s_k, s_{k+1})$ around the circle.
   - **Open-arc / wide-gap handling:** If an angular gap between consecutive speakers exceeds $\sim 170^\circ$ (such as Stereo $2.0$ with L at $+30^\circ$ and R at $-30^\circ$, leaving a $300^\circ$ rear gap where $2\times 2$ pair determinants become degenerate or invert sign), insert a **virtual rear speaker** at $180^\circ$ (`-Y`) during hull construction, and redistribute any weight falling on the virtual rear speaker equally onto its two bounding real speakers (`L` and `R`) before $L_2$ normalization (or clamp rear directions smoothly onto the front L-R arc, configurable via `OpenHullPolicy`).
-- **Case 3 (`N >= 4`, Non-Coplanar 3D Layout, e.g. 5.1.4, 7.1.4, 9.1.6, custom domes):**
-  - Normalize all `FullRange` speaker directions onto the unit sphere $S^2$.
-  - **Virtual Closure Speakers:** Most physical 3D rooms lack floor speakers ($z < 0$). Before triangulating, inspect whether the real speaker convex hull contains the origin `(0, 0, 0)` strictly inside it. If the lower hemisphere (or upper hemisphere) is open, add a **virtual nadir speaker** at `(0, 0, -1)` (and/or virtual zenith at `(0, 0, +1)` if a 3D rig lacks overhead coverage in one cone).
-  - Build the 3D convex hull of the unit vectors (for $S \le 64$, a clean, exact incremental/gift-wrapping 3D spherical convex hull takes $< 100\,\mu\text{s}$ and ~150 lines of safe Rust with zero dependencies; verify outward normals $\mathbf{n} \cdot \mathbf{v}_0 > 0$).
-  - Precompute and store $\mathbf{L}_t^{-1}$ for every triangle $t = (i, j, k)$.
-  - **Virtual Speaker Redistribution:** If the winning triangle includes a virtual speaker $v$, discard $v$'s raw slot and redistribute its weight onto the real speakers (either equally onto the 2 real speakers in that triangle, or proportionally onto the ear-level horizontal ring) before final $L_2$ normalization—ensuring 100% of energy reaches real speakers and never collapses to silence below the horizon.
+- **Case 3 (`N >= 3`, 3D & Surround Layouts, e.g. 5.1, 7.1, 5.1.4, 7.1.4, 9.1.6, custom domes):**
+  - Powered directly by Omniphony's pure-Rust `convhull` + `vbap_native` core (`prepare_triangulation`, `invert_ls_mtx_3d`, `vbap3d_into`).
+  - Automatically injects ITU-R BS.2127 virtual pole speakers ($\pm 90^\circ$) for open hemispheres/horizontal rings (`OutOfHullMode::VirtualPoles`) and virtual face centres on coplanar quads (such as the 4-speaker ceiling in 5.1.4/7.1.4), downmixing virtual gains onto adjacent real speakers before $L_2$ normalization.
+  - Supports 3D spread/MDAP natively via `spread_deg` and zero-allocation `Vbap3dScratch`.
 
 ### 4.3 Advanced Evolution (No Core Rewrites)
 
