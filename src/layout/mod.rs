@@ -20,6 +20,18 @@ pub enum SpeakerRole {
     Lfe,
 }
 
+/// Output channel ordering convention for multichannel surround layouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChannelOrder {
+    /// Microsoft `WAVE_FORMAT_EXTENSIBLE` ascending mask bit order
+    /// (`L, R, C, LFE, Lrs, Rrs, Lss, Rss, ...` for 7.1 / 7.1.4 / 7.1.6).
+    #[default]
+    Wav,
+    /// SMPTE / DAW / cinema order placing side surrounds before rear surrounds
+    /// (`L, R, C, LFE, Lss, Rss, Lrs, Rrs, ...` for 7.1 / 7.1.4 / 7.1.6).
+    Smpte,
+}
+
 /// Physical or virtual reproduction loudspeaker positioned in 3D space.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Speaker {
@@ -186,6 +198,41 @@ impl SpeakerLayout {
             "7.1.6" => Some(Self::layout_7_1_6()),
             "9.1.6" => Some(Self::layout_9_1_6()),
             _ => None,
+        }
+    }
+
+    /// Looks up a standard layout preset and applies the requested [`ChannelOrder`].
+    pub fn preset_with_order(name: &str, order: ChannelOrder) -> Option<Self> {
+        Self::preset(name).map(|layout| layout.with_channel_order(order))
+    }
+
+    /// Reorders surround channels according to `order`.
+    ///
+    /// Note: Under [`ChannelOrder::Smpte`], side surrounds (`Lss`/`Rss`) precede rear surrounds
+    /// (`Lrs`/`Rrs`), so [`Self::channel_mask`] naturally returns `0` rather than emitting a
+    /// contradictory `WAVE_FORMAT_EXTENSIBLE` channel bitmask.
+    pub fn with_channel_order(mut self, order: ChannelOrder) -> Self {
+        match order {
+            ChannelOrder::Wav => self,
+            ChannelOrder::Smpte => {
+                let find = |label: &str| {
+                    self.speakers
+                        .iter()
+                        .position(|s| s.label.eq_ignore_ascii_case(label))
+                };
+                if let (Some(lrs), Some(rrs), Some(lss), Some(rss)) =
+                    (find("Lrs"), find("Rrs"), find("Lss"), find("Rss"))
+                    && lrs < lss
+                    && rrs < rss
+                {
+                    self.speakers.swap(lrs, lss);
+                    self.speakers.swap(rrs, rss);
+                    for (idx, spk) in self.speakers.iter_mut().enumerate() {
+                        spk.id = SpeakerId(idx);
+                    }
+                }
+                self
+            }
         }
     }
 
@@ -428,5 +475,44 @@ mod tests {
             duplicate,
             Err(LayoutError::CoincidentSpeakers { .. })
         ));
+    }
+
+    #[test]
+    fn smpte_channel_order_swaps_side_and_rear_surrounds() {
+        let smpte_714 = SpeakerLayout::layout_7_1_4().with_channel_order(ChannelOrder::Smpte);
+        let labels: Vec<&str> = smpte_714
+            .speakers
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "L", "R", "C", "LFE", "Lss", "Rss", "Lrs", "Rrs", "Ltf", "Rtf", "Ltr", "Rtr"
+            ]
+        );
+        for (idx, spk) in smpte_714.speakers.iter().enumerate() {
+            assert_eq!(spk.id, SpeakerId(idx));
+        }
+        assert_eq!(smpte_714.channel_mask(), 0);
+        assert!(smpte_714.validate().is_ok());
+
+        for preset in [SpeakerLayout::surround_7_1(), SpeakerLayout::layout_7_1_6()] {
+            let smpte = preset.with_channel_order(ChannelOrder::Smpte);
+            assert_eq!(smpte.speakers[4].label, "Lss");
+            assert_eq!(smpte.speakers[5].label, "Rss");
+            assert_eq!(smpte.speakers[6].label, "Lrs");
+            assert_eq!(smpte.speakers[7].label, "Rrs");
+        }
+
+        let smpte_51 = SpeakerLayout::surround_5_1().with_channel_order(ChannelOrder::Smpte);
+        assert_eq!(smpte_51.channel_mask(), 0x3F);
+
+        let wav_714 = SpeakerLayout::preset_with_order("7.1.4", ChannelOrder::Wav).unwrap();
+        assert_eq!(wav_714.speakers[4].label, "Lrs");
+        assert_eq!(wav_714.speakers[5].label, "Rrs");
+        assert_eq!(wav_714.speakers[6].label, "Lss");
+        assert_eq!(wav_714.speakers[7].label, "Rss");
+        assert_eq!(wav_714.channel_mask(), 0x2_D63F);
     }
 }

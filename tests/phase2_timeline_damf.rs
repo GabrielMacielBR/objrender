@@ -8,10 +8,10 @@ use objrender::importers::SceneImporter;
 use objrender::importers::caf::SharedCafStream;
 use objrender::importers::damf::DamfImporter;
 use objrender::io::{SampleFormat, WaveConfig, WaveWriter};
-use objrender::layout::SpeakerLayout;
+use objrender::layout::{ChannelOrder, SpeakerLayout};
 use objrender::math::{SphericalCoord, Vec3};
 use objrender::mixer::{ClippingPolicy, LfePolicy, RenderConfig, render_scene};
-use objrender::renderer::VbapRenderer;
+use objrender::renderer::{Spatializer, VbapRenderer};
 use objrender::scene::{
     AudioObject, InMemorySource, InterpMode, Keyframe, ObjectId, ObjectRole, SceneBuilder,
     SineSource, SpatialParams,
@@ -595,4 +595,48 @@ events:
     assert_relative_eq!(decoded[f + 9], 0.0_f32, epsilon = 1e-4); // Rtf
     assert_relative_eq!(decoded[f + 10], expected_top, epsilon = 1e-3); // Ltr
     assert_relative_eq!(decoded[f + 11], 0.0_f32, epsilon = 1e-4); // Rtr
+}
+
+#[test]
+fn smpte_7_1_4_routes_side_surrounds_to_ch4_5_and_rears_to_ch6_7() {
+    let layout = SpeakerLayout::layout_7_1_4().with_channel_order(ChannelOrder::Smpte);
+    let vbap = VbapRenderer::build(&layout).unwrap();
+    let mut gains = vec![0.0_f64; layout.speakers.len()];
+    let point = SpatialParams::default();
+
+    // Lss (+90 deg) -> ch 4; Lrs (ch 6) == 0.
+    vbap.compute_gains(
+        Vec3::from_spherical(SphericalCoord::new(90.0, 0.0, 1.0)),
+        point,
+        &mut gains,
+    );
+    assert_relative_eq!(gains[4], 1.0, epsilon = 1e-4);
+    assert_relative_eq!(gains[6], 0.0, epsilon = 1e-4);
+
+    // Rss (-90 deg) -> ch 5; Rrs (ch 7) == 0.
+    vbap.compute_gains(
+        Vec3::from_spherical(SphericalCoord::new(-90.0, 0.0, 1.0)),
+        point,
+        &mut gains,
+    );
+    assert_relative_eq!(gains[5], 1.0, epsilon = 1e-4);
+    assert_relative_eq!(gains[7], 0.0, epsilon = 1e-4);
+
+    // Lrs (+135 deg) -> ch 6; Lss (ch 4) == 0.
+    vbap.compute_gains(
+        Vec3::from_spherical(SphericalCoord::new(135.0, 0.0, 1.0)),
+        point,
+        &mut gains,
+    );
+    assert_relative_eq!(gains[6], 1.0, epsilon = 1e-4);
+    assert_relative_eq!(gains[4], 0.0, epsilon = 1e-4);
+
+    // Rrs (-135 deg) -> ch 7; Rss (ch 5) == 0.
+    vbap.compute_gains(
+        Vec3::from_spherical(SphericalCoord::new(-135.0, 0.0, 1.0)),
+        point,
+        &mut gains,
+    );
+    assert_relative_eq!(gains[7], 1.0, epsilon = 1e-4);
+    assert_relative_eq!(gains[5], 0.0, epsilon = 1e-4);
 }

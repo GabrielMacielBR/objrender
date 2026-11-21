@@ -9,7 +9,7 @@ use objrender::importers::damf::{
     DamfImporter, DamfSignalSpec, DamfStaticDescriptor, DamfStaticImporter,
 };
 use objrender::io::{SampleFormat, WaveConfig, WaveWriter};
-use objrender::layout::SpeakerLayout;
+use objrender::layout::{ChannelOrder, SpeakerLayout};
 use objrender::math::{SphericalCoord, Vec3};
 use objrender::mixer::{ClippingPolicy, LfePolicy, RenderConfig, render_scene};
 use objrender::renderer::{Spatializer, VbapRenderer};
@@ -21,6 +21,7 @@ use objrender::scene::{
 struct CliArgs {
     layout_preset: String,
     layout_file: Option<PathBuf>,
+    channel_order: ChannelOrder,
     damf_manifest: Option<PathBuf>,
     az_deg: f64,
     el_deg: f64,
@@ -50,6 +51,7 @@ OPTIONS:
   --damf <path.atmos>      Render decoded truehdd/harletty DAMF master set
   --layout <name>          Preset: mono, stereo, 5.1, 7.1, 5.1.4, 7.1.4, 7.1.6, 9.1.6 [default: 7.1.4]
   --layout-file <path>     Load custom TOML speaker layout (overrides --layout)
+  --channel-order <order>  Surround channel order: wav (default), smpte (Lss/Rss before Lrs/Rrs)
   --az <deg>               Initial azimuth degrees (0=Front, +90=Left, -90=Right) [default: 0.0]
   --el <deg>               Initial elevation degrees (0=Horizon, +90=Zenith) [default: 0.0]
   --radius <r>             Distance radius [default: 1.0]
@@ -73,6 +75,7 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
     let mut cfg = CliArgs {
         layout_preset: "7.1.4".to_string(),
         layout_file: None,
+        channel_order: ChannelOrder::Wav,
         damf_manifest: None,
         az_deg: 0.0,
         el_deg: 0.0,
@@ -98,6 +101,14 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
             "--damf" => cfg.damf_manifest = Some(PathBuf::from(next_val(&mut args, &arg)?)),
             "--layout" => cfg.layout_preset = next_val(&mut args, &arg)?,
             "--layout-file" => cfg.layout_file = Some(PathBuf::from(next_val(&mut args, &arg)?)),
+            "--channel-order" => {
+                let v = next_val(&mut args, &arg)?;
+                cfg.channel_order = match v.to_ascii_lowercase().as_str() {
+                    "wav" | "wave" => ChannelOrder::Wav,
+                    "smpte" => ChannelOrder::Smpte,
+                    _ => return Err(format!("unknown channel order `{v}` (use wav or smpte)")),
+                };
+            }
             "--az" => cfg.az_deg = parse_num(&next_val(&mut args, &arg)?, &arg)?,
             "--el" => cfg.el_deg = parse_num(&next_val(&mut args, &arg)?, &arg)?,
             "--radius" => cfg.radius = parse_num(&next_val(&mut args, &arg)?, &arg)?,
@@ -182,7 +193,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         SpeakerLayout::preset(&args.layout_preset)
             .ok_or_else(|| format!("unknown layout preset `{}`", args.layout_preset))?
-    };
+    }
+    .with_channel_order(args.channel_order);
 
     let total_frames = ((args.duration_sec * args.sample_rate as f64).round() as u64).max(1);
     let mut scene = if let Some(manifest) = &args.damf_manifest {
