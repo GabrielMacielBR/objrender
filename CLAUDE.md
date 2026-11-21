@@ -8,9 +8,9 @@ Engineering guidelines, architectural boundaries, and development roadmap for **
 
 **objrender** is an open-source, specialized **offline** 3D object-based spatial audio renderer written in Rust.
 
-Its primary practical goal is to render decoded object-based cinema and home-theater audio content (such as Dolby Atmos streams decoded via `LibTrueHD` / `truehdd`, e.g., DAMF/OAMD + multichannel PCM) onto **arbitrary speaker layouts**, producing multichannel PCM buffers and **WAV / RF64** output files.
+Its primary practical goal is to render decoded 3D object-based cinema and home-theater audio streams produced by open-source decoders such as `truehdd` and `harletty` (OAMD — ETSI TS 103 420 metadata + multichannel CAF/PCM audio / DAMF filesets) onto **arbitrary speaker layouts**, producing multichannel PCM buffers and **WAV / RF64** output files.
 
-While Atmos interoperability is the motivating use case, the rendering core itself must remain **completely format-agnostic**, operating exclusively on a generic 3D object-based intermediate scene representation.
+While interoperability with these decoded object-audio master formats is the motivating use case, the rendering core itself must remain **completely format-agnostic**, operating exclusively on a generic 3D object-based intermediate scene representation.
 
 ---
 
@@ -32,25 +32,23 @@ While Atmos interoperability is the motivating use case, the rendering core itse
 
 There must be a hard separation between **Format Importers** and the **Rendering Core**:
 
-1. **Format Importer Layer** (e.g., `src/atmos/`):
-   - Reads format-specific inputs (decoded bitstreams, metadata files, PCM tracks).
+1. **Format Importer Layer** (e.g., `src/importers/damf/`):
+   - Reads format-specific decoded containers (manifest descriptors, metadata timelines, multichannel CAF/PCM tracks).
    - Interprets format-specific spatial metadata (e.g., OAMD / DAMF beds, object coordinates, size/divergence, trims).
    - Translates them into the generic intermediate `Scene` model via a Scene Builder.
 
 2. **Rendering Core** (`scene`, `layout`, `renderer`, `timeline`, `mixer`, `io`, `math`):
    - Knows **only** about generic audio objects, scenes, speaker geometry, spatialization, temporal interpolation, mixing, and PCM/WAV export.
-   - **MUST NEVER** depend on, import, or reference format-specific concepts such as `Atmos`, `Dolby`, `TrueHD`, or `MPEG-H`.
+   - **MUST NEVER** depend on `src/importers/` or any input format convention (`OAMD`/`DAMF`, `ADM`, `IAMF`, `MPEG-H`).
 
 ### Target Data Pipelines
 
 Primary target workflow:
 
 ```text
-TrueHD Atmos
+Decoded Object Stream (truehdd / harletty: OAMD + CAF)
   ↓
-LibTrueHD / truehdd
-  ↓
-Atmos Importer
+DAMF / OAMD Importer
   ↓
 Scene Builder
   ↓
@@ -68,7 +66,7 @@ Wave Writer (WAV / RF64)
 Future format extensibility (with **zero modifications** to the rendering core):
 
 ```text
-MPEG-H (or other object-based format)
+ADM (ITU-R BS.2076) / IAMF / MPEG-H
   ↓
 Format Importer
   ↓
@@ -91,9 +89,8 @@ Spatial Renderer → Mixer → PCM / Wave Writer
 - **DO NOT** copy, port, or derive source code or software architecture from Omniphony (Omniphony is licensed under `GPL-3.0`, whereas `objrender` is clean-room dual-licensed under `MIT OR Apache-2.0`).
 - **DO NOT** reproduce Omniphony's complexity, runtime ABI/plugin bridges, real-time audio server integrations, or universal-engine abstractions.
 
-### Trademark Hygiene
-- **NEVER** use third-party trademarks (such as `Dolby` or `Atmos`) in the project name, crate names, binary names, or public core API symbols.
-- Reference external formats neutrally and strictly for interoperability documentation and format-specific importer modules (e.g., `src/atmos/`).
+### Naming & Trademark Hygiene
+- Keep all project, crate, binary, module, and API identifiers grounded in neutral technical and open-standard terms (`objrender`, `importers::damf`, `OAMD`, `ADM`, `CAF`, `RF64`) rather than third-party consumer trademarks.
 
 ---
 
@@ -136,7 +133,7 @@ The renderer must support arbitrary 2D and 3D speaker configurations, including 
 **Strict rules for layouts:**
 - **NEVER** assume a fixed channel count.
 - **NEVER** hardcode fixed speaker positions in the core renderer.
-- **NEVER** bake Atmos-specific layout assumptions into the rendering math.
+- **NEVER** bake format-specific layout assumptions into the rendering math.
 - Represent every speaker explicitly by its **3D geometric position** (and channel index/role metadata as needed for WAV channel ordering or LFE handling).
 
 ---
@@ -146,7 +143,7 @@ The renderer must support arbitrary 2D and 3D speaker configurations, including 
 During architecture design and implementation, each subsystem must address the following requirements:
 
 ### Spatialization Engine
-- Compare candidate spatialization strategies across **subjective quality**, **computational cost**, **implementation simplicity**, and **suitability for Atmos-style discrete object content**:
+- Compare candidate spatialization strategies across **subjective quality**, **computational cost**, **implementation simplicity**, and **suitability for discrete cinema/home-theater object content (e.g., OAMD/DAMF)**:
   - **VBAP** (Vector Base Amplitude Panning)
   - **DBAP** (Distance-Based Amplitude Panning)
   - **MDAP** (Multiple Direction Amplitude Panning)
@@ -223,7 +220,7 @@ Target layout once implementation begins (subject to minor refinement during arc
 
 ```text
 src/
-├── atmos/      # Atmos importer & metadata translation (isolated from core)
+├── importers/  # Isolated format adapters (e.g., damf/oamd for truehdd/harletty; future adm/mpegh)
 ├── scene/      # Generic Scene, AudioObject, Keyframe intermediate model
 ├── layout/     # Arbitrary 3D speaker geometry & layout definitions
 ├── renderer/   # Spatial rendering / panning engine (VBAP, spread, etc.)
@@ -243,7 +240,7 @@ src/
 - **Phase 3**: Full 3D VBAP (including virtual speakers/hull handling as needed), object spread/width, energy normalization.
 - **Phase 4**: SIMD optimizations for inner mixing and panning loops.
 - **Phase 5**: Parallelization (e.g., object/block-level offline rendering concurrency).
-- **Phase 6**: Advanced features (e.g., RF64 streaming, Atmos importer integration with `LibTrueHD`/`truehdd` outputs, loudness/limiting tools).
+- **Phase 6**: Advanced features (e.g., RF64 streaming, DAMF/OAMD + CAF importer integration for `truehdd` / `harletty` decoded outputs, loudness/limiting tools).
 
 ---
 
