@@ -2,8 +2,17 @@
 
 An open-source, specialized **offline 3D object-based spatial audio renderer** written in Rust.
 
-> **Status: Phase 1 Static MVP Implemented**
-> Single static 3D object rendering to arbitrary speaker layouts (1D/2D/3D VBAP, WAV/RF64 export, CLI, and `proptest`/`hound` verification) is working. See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) and [CLAUDE.md](./CLAUDE.md) for architecture and roadmap details.
+> **Status: Phase 2 Implemented (Timeline, Motion & DAMF/CAF Importer)**
+> Supports moving 3D objects (`Linear` / `Spherical` SLERP / `Step`), per-sample linear gain ramping, Hann discontinuity crossfades, and decoded `truehdd`/`harletty` DAMF master sets (`.atmos` + `.atmos.metadata` + `.atmos.audio` CAF) rendered to arbitrary layouts as WAV/RF64.
+>
+> Quick CLI examples:
+> ```sh
+> # Render a decoded truehdd/harletty DAMF bundle to 7.1.4 WAV
+> cargo run -- --damf movie.atmos --layout 7.1.4 --output rendered_7_1_4.wav
+>
+> # Render a moving test sine wave orbiting from Left (+90°) to Right/Top (-90°, +45°)
+> cargo run -- --layout 7.1.4 --az 90 --el 0 --pan-to -90,45 --duration 2.0 --output orbit.wav
+> ```
 
 ---
 

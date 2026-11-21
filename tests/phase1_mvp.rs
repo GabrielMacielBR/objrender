@@ -308,6 +308,7 @@ fn wav_output_validates_with_hound_on_7_1_4() {
             block_size: 64,
             clipping: ClippingPolicy::PassThrough,
             lfe_policy: LfePolicy::DropIfAbsent,
+            ..RenderConfig::default()
         },
         Box::new(writer),
     )

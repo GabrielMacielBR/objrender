@@ -1,4 +1,6 @@
-//! Offline multi-object mixing, LFE routing, headroom policies, and render orchestration.
+//! Offline multi-object mixing, timeline ramping, LFE routing, and render orchestration.
+
+use std::f64::consts::PI;
 
 use thiserror::Error;
 
@@ -6,6 +8,7 @@ use crate::io::{IoError, OutputMetadata, PcmBus, SampleWriter};
 use crate::layout::{SpeakerLayout, SpeakerRole};
 use crate::renderer::Spatializer;
 use crate::scene::{ObjectRole, Scene};
+use crate::timeline;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ClippingPolicy {
@@ -26,6 +29,8 @@ pub enum LfePolicy {
 #[derive(Debug, Clone, Copy)]
 pub struct RenderConfig {
     pub block_size: usize,
+    /// Length of raised-cosine (Hann) anti-click crossfade on discontinuous keyframes (`0` disables).
+    pub crossfade_frames: usize,
     pub clipping: ClippingPolicy,
     pub lfe_policy: LfePolicy,
 }
@@ -34,6 +39,7 @@ impl Default for RenderConfig {
     fn default() -> Self {
         Self {
             block_size: 64,
+            crossfade_frames: 128,
             clipping: ClippingPolicy::PassThrough,
             lfe_policy: LfePolicy::DropIfAbsent,
         }
@@ -81,6 +87,26 @@ pub enum RenderError {
     InvalidConfig(String),
     #[error("I/O error during render: {0}")]
     Io(#[from] IoError),
+}
+
+struct ObjectRenderState {
+    prev_gains: Vec<f64>,
+    xfade_from: Vec<f64>,
+    xfade_total: usize,
+    xfade_remaining: usize,
+    initialized: bool,
+}
+
+impl ObjectRenderState {
+    fn new(n_spk: usize) -> Self {
+        Self {
+            prev_gains: vec![0.0; n_spk],
+            xfade_from: vec![0.0; n_spk],
+            xfade_total: 0,
+            xfade_remaining: 0,
+            initialized: false,
+        }
+    }
 }
 
 /// Renders all objects in `scene` onto `layout` using `spatializer`, writing blocks to `writer`.
@@ -133,7 +159,13 @@ pub fn render_scene(
 
     let mut bus = PcmBus::new(n_spk, config.block_size);
     let mut mono_buf = vec![0.0_f64; config.block_size];
-    let mut gains = vec![0.0_f64; n_spk];
+    let mut gains0 = vec![0.0_f64; n_spk];
+    let mut gains1 = vec![0.0_f64; n_spk];
+    let mut obj_states: Vec<ObjectRenderState> = scene
+        .objects
+        .iter()
+        .map(|_| ObjectRenderState::new(n_spk))
+        .collect();
 
     let mut stats: Vec<ChannelStats> = layout
         .speakers
@@ -148,54 +180,98 @@ pub fn render_scene(
 
     let mut frame_start: u64 = 0;
     while frame_start < scene.total_frames {
-        let remaining = scene.total_frames - frame_start;
-        let n_frames = (config.block_size as u64).min(remaining) as usize;
+        let mut block_end = frame_start
+            .saturating_add(config.block_size as u64)
+            .min(scene.total_frames);
+
+        // Split sub-blocks at discontinuous keyframe boundaries so teleports never smear early.
+        for obj in &scene.objects {
+            if let Some(disc_frame) = timeline::next_discontinuity_in(obj, frame_start, block_end) {
+                block_end = block_end.min(disc_frame);
+            }
+        }
+
+        let n_frames = (block_end - frame_start) as usize;
         bus.clear(n_frames);
 
-        for obj in &mut scene.objects {
-            if frame_start >= obj.end_frame()
-                || frame_start.saturating_add(n_frames as u64) <= obj.start_frame
-            {
+        for (obj, obj_state) in scene.objects.iter_mut().zip(obj_states.iter_mut()) {
+            if frame_start >= obj.end_frame() || block_end <= obj.start_frame {
+                obj_state.initialized = false;
+                obj_state.xfade_remaining = 0;
                 continue;
+            }
+
+            let (state0, state1) = timeline::eval_interval(obj, frame_start, block_end);
+            let is_disc = timeline::is_discontinuous_at(obj, frame_start);
+
+            if state0.gain == 0.0
+                && state1.gain == 0.0
+                && obj_state.xfade_remaining == 0
+                && !is_disc
+            {
+                obj_state.prev_gains.fill(0.0);
+                obj_state.initialized = true;
+                continue;
+            }
+
+            match obj.role {
+                ObjectRole::Lfe => {
+                    compute_lfe_gains(
+                        state0.gain,
+                        &lfe_channels,
+                        &full_range_channels,
+                        config.lfe_policy,
+                        &mut gains0,
+                    );
+                    if (state0.gain - state1.gain).abs() <= f64::EPSILON {
+                        gains1.copy_from_slice(&gains0);
+                    } else {
+                        compute_lfe_gains(
+                            state1.gain,
+                            &lfe_channels,
+                            &full_range_channels,
+                            config.lfe_policy,
+                            &mut gains1,
+                        );
+                    }
+                }
+                ObjectRole::Dynamic | ObjectRole::Bed => {
+                    spatializer.compute_gains(state0.position, state0.spatial, &mut gains0);
+                    scale_gains(&mut gains0, state0.gain);
+                    if state0 == state1 {
+                        gains1.copy_from_slice(&gains0);
+                    } else {
+                        spatializer.compute_gains(state1.position, state1.spatial, &mut gains1);
+                        scale_gains(&mut gains1, state1.gain);
+                    }
+                }
+            }
+
+            if obj_state.initialized && config.crossfade_frames > 0 && is_disc {
+                obj_state.xfade_from.copy_from_slice(&obj_state.prev_gains);
+                obj_state.xfade_total = config.crossfade_frames;
+                obj_state.xfade_remaining = config.crossfade_frames;
             }
 
             let local_offset = frame_start.saturating_sub(obj.start_frame);
             obj.source
                 .read_frames(local_offset, &mut mono_buf[..n_frames])?;
 
-            match obj.role {
-                ObjectRole::Lfe => {
-                    compute_lfe_gains(
-                        obj.initial_gain,
-                        &lfe_channels,
-                        &full_range_channels,
-                        config.lfe_policy,
-                        &mut gains,
-                    );
-                }
-                ObjectRole::Dynamic | ObjectRole::Bed => {
-                    spatializer.compute_gains(
-                        obj.initial_position,
-                        obj.initial_spatial,
-                        &mut gains,
-                    );
-                    if (obj.initial_gain - 1.0).abs() > f64::EPSILON {
-                        for g in &mut gains {
-                            *g *= obj.initial_gain;
-                        }
-                    }
-                }
+            if obj_state.xfade_remaining == 0 {
+                accumulate_linear_ramp(&mono_buf[..n_frames], &gains0, &gains1, &mut bus, n_frames);
+            } else {
+                accumulate_with_crossfade(
+                    &mono_buf[..n_frames],
+                    &gains0,
+                    &gains1,
+                    obj_state,
+                    &mut bus,
+                    n_frames,
+                );
             }
 
-            for (ch, &g) in gains.iter().enumerate() {
-                if g == 0.0 {
-                    continue;
-                }
-                let out = bus.channel_mut(ch);
-                for (dst, &src) in out[..n_frames].iter_mut().zip(&mono_buf[..n_frames]) {
-                    *dst += src * g;
-                }
-            }
+            obj_state.prev_gains.copy_from_slice(&gains1);
+            obj_state.initialized = true;
         }
 
         if (headroom_scale - 1.0).abs() > f64::EPSILON {
@@ -220,7 +296,7 @@ pub fn render_scene(
         }
 
         writer.write_block(&bus, n_frames)?;
-        frame_start += n_frames as u64;
+        frame_start = block_end;
     }
 
     let output_metadata = writer.finalize()?;
@@ -230,6 +306,89 @@ pub fn render_scene(
         output_metadata,
         channels: stats,
     })
+}
+
+fn accumulate_linear_ramp(
+    mono: &[f64],
+    gains0: &[f64],
+    gains1: &[f64],
+    bus: &mut PcmBus,
+    n_frames: usize,
+) {
+    let inv_n = 1.0 / (n_frames as f64);
+    for (ch, (&g0, &g1)) in gains0.iter().zip(gains1.iter()).enumerate() {
+        if g0 == 0.0 && g1 == 0.0 {
+            continue;
+        }
+        let out = bus.channel_mut(ch);
+        if (g1 - g0).abs() <= f64::EPSILON {
+            for (dst, &src) in out[..n_frames].iter_mut().zip(mono) {
+                *dst += src * g0;
+            }
+        } else {
+            let dg = (g1 - g0) * inv_n;
+            let mut g = g0;
+            for (dst, &src) in out[..n_frames].iter_mut().zip(mono) {
+                *dst += src * g;
+                g += dg;
+            }
+        }
+    }
+}
+
+fn accumulate_with_crossfade(
+    mono: &[f64],
+    gains0: &[f64],
+    gains1: &[f64],
+    obj_state: &mut ObjectRenderState,
+    bus: &mut PcmBus,
+    n_frames: usize,
+) {
+    let inv_n = 1.0 / (n_frames as f64);
+    let xfade_len = obj_state.xfade_remaining.min(n_frames);
+    let elapsed_base = obj_state.xfade_total - obj_state.xfade_remaining;
+    let total_f = obj_state.xfade_total as f64;
+
+    for ch in 0..gains0.len() {
+        let g0 = gains0[ch];
+        let g1 = gains1[ch];
+        let g_old = obj_state.xfade_from[ch];
+        if g0 == 0.0 && g1 == 0.0 && g_old == 0.0 {
+            continue;
+        }
+        let dg = (g1 - g0) * inv_n;
+        let out = bus.channel_mut(ch);
+
+        for (s, &src) in mono[..xfade_len].iter().enumerate() {
+            let p = ((elapsed_base + s + 1) as f64 / total_f).clamp(0.0, 1.0);
+            let alpha = 0.5 * (1.0 - (PI * p).cos());
+            let g_target = g0 + (s as f64) * dg;
+            let g = g_old * (1.0 - alpha) + g_target * alpha;
+            out[s] += src * g;
+        }
+
+        if xfade_len < n_frames {
+            let mut g = g0 + (xfade_len as f64) * dg;
+            for (dst, &src) in out[xfade_len..n_frames]
+                .iter_mut()
+                .zip(&mono[xfade_len..n_frames])
+            {
+                *dst += src * g;
+                g += dg;
+            }
+        }
+    }
+
+    obj_state.xfade_remaining = obj_state.xfade_remaining.saturating_sub(n_frames);
+}
+
+#[inline]
+fn scale_gains(gains: &mut [f64], scale: f64) {
+    if (scale - 1.0).abs() > f64::EPSILON {
+        for g in gains {
+            *g *= scale;
+        }
+    }
 }
 
 fn compute_lfe_gains(

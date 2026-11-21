@@ -241,6 +241,6 @@ src/
 
 ## 12. Current Status & Next Step
 
-**Current Stage**: **Phase 1 Static MVP implemented and verified** (`math`, `layout`, `scene`, `renderer` with Omniphony pure-Rust `convhull` + `vbap_native`, `io` WAV/RF64 writer, `mixer`, `importers::damf` stub, CLI, and `hound`/`proptest` tests). Architecture deliverables 1–10 are documented in [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md).
+**Current Stage**: **Phase 2 implemented and verified** (`src/timeline/` interpolation, per-sample gain ramping + Hann discontinuity crossfades in `src/mixer/`, streaming Apple CAF reader + real `truehdd`/`harletty` DAMF/OAMD importer in `src/importers/`, `--damf` & `--pan-to` CLI flags, and 24 passing tests). Architecture deliverables 1–10 are documented in [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md).
 
-**Next Step (Phase 2)**: Add `src/timeline/` (keyframe interpolation, per-sample linear gain ramping, discontinuity crossfades) and connect it to `src/mixer/`.
+**Next Step (Phase 3+)**: Extend mixing normalization/headroom (`TwoPassPeakNormalize`), near-origin smooth blending, and Phase 4–5 SIMD (`pulp`) & `rayon` optimizations.

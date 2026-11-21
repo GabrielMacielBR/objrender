@@ -9,3 +9,4 @@ pub mod math;
 pub mod mixer;
 pub mod renderer;
 pub mod scene;
+pub mod timeline;

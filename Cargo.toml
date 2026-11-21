@@ -8,6 +8,7 @@ repository = "https://github.com/GabrielMacielBR/objrender"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
 thiserror = "2"
 toml = "0.8"
 

@@ -1,6 +1,6 @@
 # objrender — Architecture & Technical Design Specification
 
-> **Status:** Architecture Specification (Phase 1 Static MVP Implemented)  
+> **Status:** Architecture Specification (Phase 2 Implemented: Timeline, Motion & DAMF/CAF Importer)  
 > **License:** `GPL-3.0-or-later` (see `LICENSE`)
 
 This document defines the complete software architecture, mathematical models, DSP algorithms, Rust data types, crate selections, phased implementation plan, verification strategy, and technical risks for **objrender**.
