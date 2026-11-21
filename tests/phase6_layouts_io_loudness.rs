@@ -4,11 +4,15 @@ use std::sync::{Arc, Mutex};
 
 use approx::assert_relative_eq;
 use objrender::io::{
-    DitherMode, PcmBus, RawPcmWriter, SampleFormat, StreamingWaveWriter, WaveConfig, WaveWriter,
+    DitherMode, NullWriter, PcmBus, RawPcmWriter, SampleFormat, StreamingWaveWriter, WaveConfig,
+    WaveWriter,
 };
 use objrender::layout::{ChannelOrder, SpeakerLayout, SpeakerRole};
 use objrender::math::{SphericalCoord, Vec3};
-use objrender::mixer::{ClippingPolicy, LoudnessMeter, RenderConfig, render_scene};
+use objrender::mixer::{
+    ClippingPolicy, LoudnessMeter, RenderConfig, RenderProgress, render_scene,
+    render_scene_with_progress,
+};
 use objrender::renderer::{Spatializer, VbapRenderer};
 use objrender::scene::{
     AudioObject, ImpulseSource, ObjectId, ObjectRole, SceneBuilder, SineSource, SpatialParams,
@@ -412,6 +416,152 @@ fn two_pass_lufs_normalization_hits_target_respects_true_peak_ceiling_and_is_bit
 
     assert_relative_eq!(ceil_report.true_peak_dbtp.unwrap(), -1.0, epsilon = 0.05);
     assert!(ceil_report.integrated_lufs.unwrap() < -6.0);
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn render_scene_with_progress_reports_monotonic_single_and_two_pass_updates() {
+    let layout = SpeakerLayout::stereo();
+    let vbap = VbapRenderer::build(&layout).unwrap();
+    let sr = 48_000u32;
+    let total_frames = 12_288u64;
+
+    let mut scene = SceneBuilder::new(sr, total_frames)
+        .add_object(AudioObject::static_mono(
+            ObjectId(1),
+            "tone",
+            ObjectRole::Dynamic,
+            Vec3::from_spherical(SphericalCoord::new(30.0, 0.0, 1.0)),
+            0.5,
+            Box::new(SineSource::new(sr, 440.0, 0.4, total_frames)),
+        ))
+        .build()
+        .unwrap();
+
+    let mut updates_single = Vec::new();
+    let mut cb1 = |p: RenderProgress| updates_single.push(p);
+    render_scene_with_progress(
+        &mut scene,
+        &layout,
+        &vbap,
+        RenderConfig {
+            threads: 1,
+            ..RenderConfig::default()
+        },
+        Box::new(NullWriter::default()),
+        Some(&mut cb1),
+    )
+    .unwrap();
+    assert!(updates_single.len() >= 2);
+    assert_eq!(updates_single.first().unwrap().frames_done, 0);
+    assert_eq!(updates_single.last().unwrap().frames_done, total_frames);
+    assert!(
+        updates_single
+            .iter()
+            .all(|u| u.pass == 1 && u.total_passes == 1 && u.total_frames == total_frames)
+    );
+    assert!(
+        updates_single
+            .windows(2)
+            .all(|w| w[0].frames_done <= w[1].frames_done)
+    );
+
+    let mut updates_two_pass = Vec::new();
+    let mut cb2 = |p: RenderProgress| updates_two_pass.push(p);
+    render_scene_with_progress(
+        &mut scene,
+        &layout,
+        &vbap,
+        RenderConfig {
+            clipping: ClippingPolicy::TwoPassPeakNormalize { target_dbfs: -1.0 },
+            threads: 4,
+            ..RenderConfig::default()
+        },
+        Box::new(NullWriter::default()),
+        Some(&mut cb2),
+    )
+    .unwrap();
+    let pass1: Vec<_> = updates_two_pass.iter().filter(|u| u.pass == 1).collect();
+    let pass2: Vec<_> = updates_two_pass.iter().filter(|u| u.pass == 2).collect();
+    assert!(!pass1.is_empty() && !pass2.is_empty());
+    assert!(updates_two_pass.iter().all(|u| u.total_passes == 2));
+    assert_eq!(pass1.last().unwrap().frames_done, total_frames);
+    assert_eq!(pass2.first().unwrap().frames_done, 0);
+    assert_eq!(pass2.last().unwrap().frames_done, total_frames);
+}
+
+#[test]
+fn cli_version_and_json_progress_streams_work_for_file_and_stdout_pipe() {
+    let bin = env!("CARGO_BIN_EXE_objrender");
+    let ver_out = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(ver_out.status.success());
+    let ver_str = String::from_utf8_lossy(&ver_out.stdout);
+    assert!(ver_str.starts_with("objrender "));
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("objrender_p6_cli_json_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir).unwrap();
+    let out_wav = tmp_dir.join("cli_json.wav");
+
+    let file_res = std::process::Command::new(bin)
+        .args([
+            "--layout",
+            "stereo",
+            "--duration",
+            "0.2",
+            "--normalize-peak",
+            "-1.0",
+            "--progress",
+            "--json",
+            "--output",
+        ])
+        .arg(&out_wav)
+        .output()
+        .unwrap();
+    assert!(file_res.status.success());
+    let stdout_text = String::from_utf8(file_res.stdout).unwrap();
+    let lines: Vec<&str> = stdout_text.lines().collect();
+    assert!(
+        lines.len() >= 3,
+        "expected progress + complete NDJSON lines"
+    );
+    assert!(lines.iter().any(|l| l.contains(r#""schema":1"#)
+        && l.contains(r#""event":"progress""#)
+        && l.contains(r#""pass":1"#)));
+    assert!(lines.iter().any(|l| l.contains(r#""schema":1"#)
+        && l.contains(r#""event":"progress""#)
+        && l.contains(r#""pass":2"#)));
+    let complete = lines.last().unwrap();
+    assert!(complete.contains(r#""event":"complete""#));
+    assert!(complete.contains(r#""format":"f32""#));
+    assert!(complete.contains(r#""channels":[{"index":0"#));
+
+    let pipe_res = std::process::Command::new(bin)
+        .args([
+            "--layout",
+            "stereo",
+            "--duration",
+            "0.1",
+            "--progress",
+            "--json",
+            "--output",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(pipe_res.status.success());
+    assert!(
+        pipe_res.stdout.starts_with(b"RIFF"),
+        "stdout binary WAV must not be corrupted by JSON logs"
+    );
+    let stderr_text = String::from_utf8(pipe_res.stderr).unwrap();
+    assert!(stderr_text.contains(r#""event":"progress""#));
+    assert!(stderr_text.contains(r#""event":"complete""#));
 
     let _ = fs::remove_dir_all(&tmp_dir);
 }

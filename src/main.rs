@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
 use std::env;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process;
+use std::time::{Duration, Instant};
 
 use objrender::importers::SceneImporter;
 use objrender::importers::damf::{
@@ -14,7 +16,9 @@ use objrender::io::{
 };
 use objrender::layout::{ChannelOrder, SpeakerLayout};
 use objrender::math::{SphericalCoord, Vec3};
-use objrender::mixer::{ClippingPolicy, LfePolicy, RenderConfig, render_scene};
+use objrender::mixer::{
+    ClippingPolicy, LfePolicy, RenderConfig, RenderProgress, render_scene_with_progress,
+};
 use objrender::renderer::{DEFAULT_NEAR_ORIGIN_RADIUS, OutOfHullMode, Spatializer, VbapRenderer};
 use objrender::scene::{
     AudioObject, InterpMode, Keyframe, ObjectId, ObjectRole, SceneBuilder, SineSource,
@@ -50,7 +54,15 @@ struct CliArgs {
     format: SampleFormat,
     dither: DitherMode,
     raw_pcm: bool,
+    progress: bool,
+    json: bool,
     output: PathBuf,
+}
+
+enum ParsedCli {
+    Help,
+    Version,
+    Run(Box<CliArgs>),
 }
 
 fn print_usage() {
@@ -89,12 +101,15 @@ OPTIONS:
   --format <fmt>               Output sample format: i16, i24, f32, f64 [default: f32]
   --dither <mode>              Integer PCM dither: auto (TPDF for i16), none, tpdf [default: auto]
   --raw-pcm                    Write headerless interleaved little-endian PCM instead of WAV
+  --progress                   Emit throttled progress updates (stderr, or NDJSON with --json)
+  --json                       Emit NDJSON (schema: 1) progress/complete output (to stderr if --output -)
   --output <path|->            Output WAV/RF64 file path, or '-' for stdout pipe [default: render.wav]
+  -V, --version                Print version
   -h, --help                   Print help"
     );
 }
 
-fn parse_args() -> Result<Option<CliArgs>, String> {
+fn parse_args() -> Result<ParsedCli, String> {
     let mut cfg = CliArgs {
         layout_preset: "7.1.4".to_string(),
         layout_file: None,
@@ -124,13 +139,16 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
         format: SampleFormat::Float32,
         dither: DitherMode::Auto,
         raw_pcm: false,
+        progress: false,
+        json: false,
         output: PathBuf::from("render.wav"),
     };
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-h" | "--help" => return Ok(None),
+            "-h" | "--help" => return Ok(ParsedCli::Help),
+            "-V" | "--version" => return Ok(ParsedCli::Version),
             "--damf" => cfg.damf_manifest = Some(PathBuf::from(next_val(&mut args, &arg)?)),
             "--layout" => cfg.layout_preset = next_val(&mut args, &arg)?,
             "--layout-file" => cfg.layout_file = Some(PathBuf::from(next_val(&mut args, &arg)?)),
@@ -238,12 +256,14 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
                 };
             }
             "--raw-pcm" => cfg.raw_pcm = true,
+            "--progress" => cfg.progress = true,
+            "--json" => cfg.json = true,
             "--output" => cfg.output = PathBuf::from(next_val(&mut args, &arg)?),
             unknown => return Err(format!("unknown argument `{unknown}`")),
         }
     }
 
-    Ok(Some(cfg))
+    Ok(ParsedCli::Run(Box::new(cfg)))
 }
 
 fn next_val(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -304,9 +324,16 @@ fn parse_lfe_policy(raw: &str) -> Result<LfePolicy, String> {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(args) = parse_args().map_err(|e| format!("{e}\nUse --help for usage."))? else {
-        print_usage();
-        return Ok(());
+    let args = match parse_args().map_err(|e| format!("{e}\nUse --help for usage."))? {
+        ParsedCli::Help => {
+            print_usage();
+            return Ok(());
+        }
+        ParsedCli::Version => {
+            println!("objrender {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        ParsedCli::Run(args) => args,
     };
 
     let layout = if let Some(path) = &args.layout_file {
@@ -450,7 +477,66 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(WaveWriter::create(&args.output, wave_cfg)?)
     };
 
-    let report = render_scene(
+    let mut last_progress_at: Option<Instant> = None;
+    let mut last_pass: u8 = 0;
+    let mut progress_cb = |p: RenderProgress| {
+        if !args.progress {
+            return;
+        }
+        let now = Instant::now();
+        let pass_changed = p.pass != last_pass;
+        let is_edge = p.frames_done == 0 || p.frames_done >= p.total_frames;
+        let elapsed_ok = last_progress_at
+            .map(|t| now.duration_since(t) >= Duration::from_millis(50))
+            .unwrap_or(true);
+        if !pass_changed && !is_edge && !elapsed_ok {
+            return;
+        }
+        if !args.json && pass_changed && last_pass != 0 {
+            let _ = writeln!(std::io::stderr());
+        }
+        last_pass = p.pass;
+        last_progress_at = Some(now);
+
+        let percent = if p.total_frames == 0 {
+            100.0
+        } else {
+            (p.frames_done as f64) * 100.0 / (p.total_frames as f64)
+        };
+        if args.json {
+            let line = format!(
+                "{{\"schema\":1,\"event\":\"progress\",\"pass\":{},\"total_passes\":{},\"frames_done\":{},\"total_frames\":{},\"percent\":{:.2}}}",
+                p.pass, p.total_passes, p.frames_done, p.total_frames, percent
+            );
+            if to_stdout {
+                let mut err = std::io::stderr().lock();
+                let _ = writeln!(err, "{line}");
+                let _ = err.flush();
+            } else {
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(out, "{line}");
+                let _ = out.flush();
+            }
+        } else {
+            let mut err = std::io::stderr().lock();
+            if p.frames_done >= p.total_frames {
+                let _ = writeln!(
+                    err,
+                    "\r[pass {}/{}] {:5.1}% ({}/{} frames)",
+                    p.pass, p.total_passes, percent, p.frames_done, p.total_frames
+                );
+            } else {
+                let _ = write!(
+                    err,
+                    "\r[pass {}/{}] {:5.1}% ({}/{} frames)",
+                    p.pass, p.total_passes, percent, p.frames_done, p.total_frames
+                );
+            }
+            let _ = err.flush();
+        }
+    };
+
+    let report = render_scene_with_progress(
         &mut scene,
         &layout,
         &spatializer,
@@ -462,67 +548,176 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             threads: args.threads,
         },
         writer,
+        args.progress
+            .then_some(&mut progress_cb as &mut dyn FnMut(RenderProgress)),
     )?;
 
-    let mut info_out: Box<dyn std::io::Write> = if to_stdout {
+    let mut info_out: Box<dyn Write> = if to_stdout {
         Box::new(std::io::stderr())
     } else {
         Box::new(std::io::stdout())
     };
-    let gain_suffix = if (report.applied_gain_linear - 1.0).abs() > 1e-6 {
-        format!(", gain={:+.2} dB", report.applied_gain_db())
+    if args.json {
+        emit_ndjson_complete(
+            &mut *info_out,
+            &args,
+            &layout,
+            scene.sample_rate,
+            scene.objects.len(),
+            &report,
+        )?;
     } else {
-        String::new()
-    };
-    let lufs_suffix = match (report.integrated_lufs, report.true_peak_dbtp) {
-        (Some(lufs), Some(tp)) => format!(", lufs={lufs:.2} LUFS, true_peak={tp:.2} dBTP"),
-        _ => String::new(),
-    };
-    writeln!(
-        info_out,
-        "Rendered {} frames ({} Hz, {} objects) to {} [layout: {}, {} ch, rf64={}{}{}]",
-        report.frames_rendered,
-        scene.sample_rate,
-        scene.objects.len(),
-        if to_stdout {
-            if args.raw_pcm {
-                "stdout(raw)".to_string()
+        let output_label = output_display(&args, to_stdout);
+        let gain_suffix = if (report.applied_gain_linear - 1.0).abs() > 1e-6 {
+            format!(", gain={:+.2} dB", report.applied_gain_db())
+        } else {
+            String::new()
+        };
+        let lufs_suffix = match (report.integrated_lufs, report.true_peak_dbtp) {
+            (Some(lufs), Some(tp)) => format!(", lufs={lufs:.2} LUFS, true_peak={tp:.2} dBTP"),
+            _ => String::new(),
+        };
+        writeln!(
+            info_out,
+            "Rendered {} frames ({} Hz, {} objects) to {} [layout: {}, {} ch, rf64={}{}{}]",
+            report.frames_rendered,
+            scene.sample_rate,
+            scene.objects.len(),
+            output_label,
+            layout.name,
+            layout.speakers.len(),
+            report.rf64_promoted,
+            gain_suffix,
+            lufs_suffix
+        )?;
+        for (idx, ch) in report.channels.iter().enumerate() {
+            if let Some(ref gains) = preview_gains {
+                writeln!(
+                    info_out,
+                    "  ch {:02} ({:<4}): initial_gain={:.4}  peak={:.2} dBFS  rms={:.2} dBFS",
+                    idx,
+                    ch.speaker_label,
+                    gains[idx],
+                    ch.peak_dbfs(),
+                    ch.rms_dbfs(report.frames_rendered)
+                )?;
             } else {
-                "stdout(wav)".to_string()
+                writeln!(
+                    info_out,
+                    "  ch {:02} ({:<4}): peak={:7.2} dBFS  rms={:7.2} dBFS",
+                    idx,
+                    ch.speaker_label,
+                    ch.peak_dbfs(),
+                    ch.rms_dbfs(report.frames_rendered)
+                )?;
             }
-        } else {
-            args.output.display().to_string()
-        },
-        layout.name,
-        layout.speakers.len(),
-        report.rf64_promoted,
-        gain_suffix,
-        lufs_suffix
-    )?;
-    for (idx, ch) in report.channels.iter().enumerate() {
-        if let Some(ref gains) = preview_gains {
-            writeln!(
-                info_out,
-                "  ch {:02} ({:<4}): initial_gain={:.4}  peak={:.2} dBFS  rms={:.2} dBFS",
-                idx,
-                ch.speaker_label,
-                gains[idx],
-                ch.peak_dbfs(),
-                ch.rms_dbfs(report.frames_rendered)
-            )?;
-        } else {
-            writeln!(
-                info_out,
-                "  ch {:02} ({:<4}): peak={:7.2} dBFS  rms={:7.2} dBFS",
-                idx,
-                ch.speaker_label,
-                ch.peak_dbfs(),
-                ch.rms_dbfs(report.frames_rendered)
-            )?;
         }
     }
 
     Ok(())
+}
+
+fn output_display(args: &CliArgs, to_stdout: bool) -> String {
+    if to_stdout {
+        if args.raw_pcm {
+            "stdout(raw)".to_string()
+        } else {
+            "stdout(wav)".to_string()
+        }
+    } else {
+        args.output.display().to_string()
+    }
+}
+
+fn format_label(fmt: SampleFormat) -> &'static str {
+    match fmt {
+        SampleFormat::Int16 => "i16",
+        SampleFormat::Int24 => "i24",
+        SampleFormat::Float32 => "f32",
+        SampleFormat::Float64 => "f64",
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_f64(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else {
+        "null".to_string()
+    }
+}
+
+fn json_opt_f64(v: Option<f64>) -> String {
+    match v {
+        Some(x) => json_f64(x),
+        None => "null".to_string(),
+    }
+}
+
+fn emit_ndjson_complete(
+    out: &mut dyn Write,
+    args: &CliArgs,
+    layout: &SpeakerLayout,
+    sample_rate: u32,
+    num_objects: usize,
+    report: &objrender::mixer::RenderReport,
+) -> std::io::Result<()> {
+    let to_stdout = args.output.as_os_str() == "-";
+    let output_label = output_display(args, to_stdout);
+    let mut channels_json = String::from("[");
+    for (idx, ch) in report.channels.iter().enumerate() {
+        if idx > 0 {
+            channels_json.push(',');
+        }
+        channels_json.push_str(&format!(
+            "{{\"index\":{},\"label\":{},\"peak_linear\":{},\"peak_dbfs\":{},\"rms_dbfs\":{},\"clipped_samples\":{}}}",
+            idx,
+            json_escape(&ch.speaker_label),
+            json_f64(ch.peak_linear),
+            json_f64(ch.peak_dbfs()),
+            json_f64(ch.rms_dbfs(report.frames_rendered)),
+            ch.clipped_samples
+        ));
+    }
+    channels_json.push(']');
+
+    writeln!(
+        out,
+        "{{\"schema\":1,\"event\":\"complete\",\"frames_rendered\":{},\"sample_rate\":{},\"num_objects\":{},\"layout\":{},\"num_channels\":{},\"format\":{},\"output\":{},\"rf64_promoted\":{},\"applied_gain_linear\":{},\"applied_gain_db\":{},\"integrated_lufs\":{},\"true_peak_dbtp\":{},\"channels\":{}}}",
+        report.frames_rendered,
+        sample_rate,
+        num_objects,
+        json_escape(&layout.name),
+        layout.speakers.len(),
+        json_escape(format_label(args.format)),
+        json_escape(&output_label),
+        report.rf64_promoted,
+        json_f64(report.applied_gain_linear),
+        json_f64(report.applied_gain_db()),
+        json_opt_f64(report.integrated_lufs),
+        json_opt_f64(report.true_peak_dbtp),
+        channels_json
+    )?;
+    out.flush()
 }
 
 fn main() {

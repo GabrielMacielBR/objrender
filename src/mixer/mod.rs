@@ -190,6 +190,27 @@ struct BatchSlot {
     stats: Vec<ChannelStats>,
 }
 
+/// Progress update emitted during offline rendering passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderProgress {
+    /// 1-based current pass (`1` for single-pass or analysis pass, `2` for second pass).
+    pub pass: u8,
+    /// Total number of passes (`1` or `2`).
+    pub total_passes: u8,
+    /// Frames completed so far in the current pass.
+    pub frames_done: u64,
+    /// Total frames in the scene.
+    pub total_frames: u64,
+}
+
+struct RenderPassOptions<'a, 'p, 'f> {
+    output_scale: f64,
+    pool: Option<&'a rayon::ThreadPool>,
+    pass: u8,
+    total_passes: u8,
+    progress: Option<&'p mut (dyn FnMut(RenderProgress) + 'f)>,
+}
+
 /// Renders all objects in `scene` onto `layout` using `spatializer`, writing blocks to `writer`.
 pub fn render_scene(
     scene: &mut Scene,
@@ -197,6 +218,18 @@ pub fn render_scene(
     spatializer: &dyn Spatializer,
     config: RenderConfig,
     writer: Box<dyn SampleWriter>,
+) -> Result<RenderReport, RenderError> {
+    render_scene_with_progress(scene, layout, spatializer, config, writer, None)
+}
+
+/// Renders all objects in `scene` onto `layout` while invoking `progress` after each pass/batch.
+pub fn render_scene_with_progress(
+    scene: &mut Scene,
+    layout: &SpeakerLayout,
+    spatializer: &dyn Spatializer,
+    config: RenderConfig,
+    writer: Box<dyn SampleWriter>,
+    mut progress: Option<&mut dyn FnMut(RenderProgress)>,
 ) -> Result<RenderReport, RenderError> {
     if config.block_size == 0 {
         return Err(RenderError::InvalidConfig(
@@ -233,9 +266,20 @@ pub fn render_scene(
     let pool = custom_pool.as_ref();
 
     match config.clipping {
-        ClippingPolicy::PassThrough => {
-            run_render_pass(scene, layout, spatializer, config, 1.0, writer, pool)
-        }
+        ClippingPolicy::PassThrough => run_render_pass(
+            scene,
+            layout,
+            spatializer,
+            config,
+            writer,
+            RenderPassOptions {
+                output_scale: 1.0,
+                pool,
+                pass: 1,
+                total_passes: 1,
+                progress,
+            },
+        ),
         ClippingPolicy::FixedHeadroomDb(db) => {
             if !db.is_finite() || db < 0.0 {
                 return Err(RenderError::InvalidConfig(
@@ -243,7 +287,20 @@ pub fn render_scene(
                 ));
             }
             let scale = 10.0_f64.powf(-db / 20.0);
-            run_render_pass(scene, layout, spatializer, config, scale, writer, pool)
+            run_render_pass(
+                scene,
+                layout,
+                spatializer,
+                config,
+                writer,
+                RenderPassOptions {
+                    output_scale: scale,
+                    pool,
+                    pass: 1,
+                    total_passes: 1,
+                    progress,
+                },
+            )
         }
         ClippingPolicy::TwoPassPeakNormalize { target_dbfs } => {
             if !target_dbfs.is_finite() || target_dbfs > 0.0 {
@@ -256,9 +313,14 @@ pub fn render_scene(
                 layout,
                 spatializer,
                 config,
-                1.0,
                 Box::new(NullWriter::default()),
-                pool,
+                RenderPassOptions {
+                    output_scale: 1.0,
+                    pool,
+                    pass: 1,
+                    total_passes: 2,
+                    progress: progress.as_deref_mut(),
+                },
             )?;
             let max_peak = analysis
                 .channels
@@ -270,7 +332,20 @@ pub fn render_scene(
             } else {
                 10.0_f64.powf(target_dbfs / 20.0) / max_peak
             };
-            run_render_pass(scene, layout, spatializer, config, norm_scale, writer, pool)
+            run_render_pass(
+                scene,
+                layout,
+                spatializer,
+                config,
+                writer,
+                RenderPassOptions {
+                    output_scale: norm_scale,
+                    pool,
+                    pass: 2,
+                    total_passes: 2,
+                    progress,
+                },
+            )
         }
         ClippingPolicy::TwoPassLoudnessNormalize {
             target_lufs,
@@ -294,9 +369,14 @@ pub fn render_scene(
                 layout,
                 spatializer,
                 config,
-                1.0,
                 analysis_writer,
-                pool,
+                RenderPassOptions {
+                    output_scale: 1.0,
+                    pool,
+                    pass: 1,
+                    total_passes: 2,
+                    progress: progress.as_deref_mut(),
+                },
             )?;
             let measured = measurement_slot
                 .lock()
@@ -320,8 +400,20 @@ pub fn render_scene(
                 }
             };
 
-            let mut report =
-                run_render_pass(scene, layout, spatializer, config, norm_scale, writer, pool)?;
+            let mut report = run_render_pass(
+                scene,
+                layout,
+                spatializer,
+                config,
+                writer,
+                RenderPassOptions {
+                    output_scale: norm_scale,
+                    pool,
+                    pass: 2,
+                    total_passes: 2,
+                    progress,
+                },
+            )?;
             if measured.integrated_lufs.is_finite() {
                 let gain_db = 20.0 * norm_scale.log10();
                 report.integrated_lufs = Some(measured.integrated_lufs + gain_db);
@@ -371,10 +463,16 @@ fn run_render_pass(
     layout: &SpeakerLayout,
     spatializer: &dyn Spatializer,
     config: RenderConfig,
-    output_scale: f64,
     mut writer: Box<dyn SampleWriter>,
-    pool: Option<&rayon::ThreadPool>,
+    opts: RenderPassOptions<'_, '_, '_>,
 ) -> Result<RenderReport, RenderError> {
+    let RenderPassOptions {
+        output_scale,
+        pool,
+        pass,
+        total_passes,
+        mut progress,
+    } = opts;
     let n_spk = layout.speakers.len();
     let lfe_channels: Vec<usize> = layout
         .speakers
@@ -413,6 +511,18 @@ fn run_render_pass(
         rayon::current_num_threads().max(1)
     };
 
+    let mut report_progress = |frames_done: u64| {
+        if let Some(cb) = progress.as_deref_mut() {
+            cb(RenderProgress {
+                pass,
+                total_passes,
+                frames_done,
+                total_frames: scene.total_frames,
+            });
+        }
+    };
+    report_progress(0);
+
     if effective_threads <= 1 || num_chunks <= 1 {
         let mut bus = PcmBus::new(n_spk, chunk_frames);
         let mut scratch = ChunkScratch::new(n_spk, chunk_frames, config.block_size);
@@ -436,6 +546,7 @@ fn run_render_pass(
             )?;
             fold_chunk_stats(&mut stats, &chunk_stats);
             writer.write_block(&bus, chunk_len)?;
+            report_progress(chunk_end);
         }
     } else {
         let batch_size = (effective_threads * 2).clamp(4, 32);
@@ -489,6 +600,8 @@ fn run_render_pass(
                 fold_chunk_stats(&mut stats, &slot.stats);
                 writer.write_block(&slot.bus, slot.frames)?;
             }
+            let done = ((batch_end as u64) * (chunk_frames as u64)).min(scene.total_frames);
+            report_progress(done);
             chunk_idx = batch_end;
         }
     }

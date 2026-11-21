@@ -36,7 +36,7 @@ An open-source, offline 3D object-based spatial audio renderer written in safe R
 
 ## Building
 
-Requires a Rust toolchain supporting **Edition 2024**.
+Requires a Rust toolchain supporting **Edition 2024** (or download prebuilt archives for Windows x64, Linux x64, and macOS Universal/arm64/x64 with `SHA256SUMS.txt` from [GitHub Releases](https://github.com/GabrielMacielBR/objrender/releases)).
 
 ```sh
 git clone https://github.com/GabrielMacielBR/objrender.git
@@ -188,8 +188,13 @@ radius = 1.0
 | `--format <fmt>` | Output format: `i16`, `i24`, `f32`, or `f64` | `f32` |
 | `--dither <mode>` | Integer PCM dither: `auto` (TPDF on `i16`), `none`, or `tpdf` | `auto` |
 | `--raw-pcm` | Emit headerless interleaved little-endian PCM instead of WAV container | Off |
+| `--progress` | Emit throttled progress updates (`stderr`, or NDJSON with `--json`) | Off |
+| `--json` | Emit NDJSON (`schema: 1`) `progress` / `complete` lines (`stderr` if `--output -`) | Off |
 | `--output <path\|->` | Output file path, or `-` to stream directly to `stdout` | `render.wav` |
+| `-V`, `--version` | Print version and exit | — |
 | `-h`, `--help` | Print CLI help | — |
+
+> **Automation / GUI Integration**: Passing `--progress --json` emits newline-delimited JSON (`"schema": 1`, `"event": "progress"` and `"event": "complete"`). When streaming audio to stdout (`--output -`), all JSON or human logs automatically route to `stderr` so binary audio pipes remain uncorrupted. Prebuilt archives in [GitHub Releases](https://github.com/GabrielMacielBR/objrender/releases) include `SHA256SUMS.txt` for integrity verification.
 
 ---
 
