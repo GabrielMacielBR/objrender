@@ -4,7 +4,7 @@ mod convhull;
 pub mod vbap;
 pub(crate) mod vbap_native;
 
-pub use vbap::VbapRenderer;
+pub use vbap::{DEFAULT_NEAR_ORIGIN_RADIUS, VbapRenderer};
 pub use vbap_native::OutOfHullMode;
 
 use crate::math::Vec3;

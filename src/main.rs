@@ -12,7 +12,7 @@ use objrender::io::{SampleFormat, WaveConfig, WaveWriter};
 use objrender::layout::{ChannelOrder, SpeakerLayout};
 use objrender::math::{SphericalCoord, Vec3};
 use objrender::mixer::{ClippingPolicy, LfePolicy, RenderConfig, render_scene};
-use objrender::renderer::{Spatializer, VbapRenderer};
+use objrender::renderer::{DEFAULT_NEAR_ORIGIN_RADIUS, OutOfHullMode, Spatializer, VbapRenderer};
 use objrender::scene::{
     AudioObject, InterpMode, Keyframe, ObjectId, ObjectRole, SceneBuilder, SineSource,
     SpatialParams,
@@ -30,11 +30,16 @@ struct CliArgs {
     interp: InterpMode,
     damf_pos: Option<[f64; 3]>,
     width: f64,
+    divergence: f64,
+    near_origin_radius: f64,
+    out_of_hull: OutOfHullMode,
     gain: f64,
     freq_hz: f64,
     duration_sec: f64,
     sample_rate: u32,
     headroom_db: Option<f64>,
+    normalize_peak: Option<f64>,
+    lfe_policy: LfePolicy,
     crossfade_frames: usize,
     format: SampleFormat,
     output: PathBuf,
@@ -42,32 +47,37 @@ struct CliArgs {
 
 fn print_usage() {
     eprintln!(
-        "objrender — Offline 3D object-based spatial audio renderer (Phase 2)
+        "objrender — Offline 3D object-based spatial audio renderer (Phase 3)
 
 USAGE:
   objrender [OPTIONS]
 
 OPTIONS:
-  --damf <path.atmos>      Render decoded truehdd/harletty DAMF master set
-  --layout <name>          Preset: mono, stereo, 5.1, 7.1, 5.1.4, 7.1.4, 7.1.6, 9.1.6 [default: 7.1.4]
-  --layout-file <path>     Load custom TOML speaker layout (overrides --layout)
-  --channel-order <order>  Surround channel order: wav (default), smpte (Lss/Rss before Lrs/Rrs)
-  --az <deg>               Initial azimuth degrees (0=Front, +90=Left, -90=Right) [default: 0.0]
-  --el <deg>               Initial elevation degrees (0=Horizon, +90=Zenith) [default: 0.0]
-  --radius <r>             Distance radius [default: 1.0]
-  --pan-to <az,el>         Animate test sine wave from (--az,--el) to (az,el) over --duration
-  --interp <mode>          Trajectory interpolation: linear, spherical [default: spherical]
-  --damf-pos <x,y,z>       Synthetic normalized room-cube coords (x,y in [0,1], z in [-1,1])
-  --width <0..1>           Object spatial spread width [default: 0.0]
-  --gain <linear>          Object linear gain [default: 1.0]
-  --freq <hz>              Test sine wave frequency in Hz [default: 1000.0]
-  --duration <sec>         Test signal duration in seconds [default: 1.0]
-  --sample-rate <hz>       Test signal sample rate in Hz [default: 48000]
-  --headroom-db <db>       Optional static headroom attenuation in dB
-  --crossfade-frames <n>   Anti-click Hann crossfade frames on jumps [default: 128]
-  --format <f32|f64>       Output sample format [default: f32]
-  --output <path.wav>      Output WAV/RF64 file path [default: render.wav]
-  -h, --help               Print help"
+  --damf <path.atmos>          Render decoded truehdd/harletty DAMF master set
+  --layout <name>              Preset: mono, stereo, 5.1, 7.1, 5.1.4, 7.1.4, 7.1.6, 9.1.6 [default: 7.1.4]
+  --layout-file <path>         Load custom TOML speaker layout (overrides --layout)
+  --channel-order <order>      Surround channel order: wav (default), smpte (Lss/Rss before Lrs/Rrs)
+  --az <deg>                   Initial azimuth degrees (0=Front, +90=Left, -90=Right) [default: 0.0]
+  --el <deg>                   Initial elevation degrees (0=Horizon, +90=Zenith) [default: 0.0]
+  --radius <r>                 Distance radius [default: 1.0]
+  --pan-to <az,el>             Animate test sine wave from (--az,--el) to (az,el) over --duration
+  --interp <mode>              Trajectory interpolation: linear, spherical [default: spherical]
+  --damf-pos <x,y,z>           Synthetic normalized room-cube coords (x,y in [0,1], z in [-1,1])
+  --width <0..1>               Object spatial spread width [default: 0.0]
+  --divergence <0..1>          Object omnidirectional divergence diffusion [default: 0.0]
+  --near-origin-radius <r>     Smooth omnidirectional blend radius near origin (0 disables) [default: 0.15]
+  --out-of-hull <mode>         Out-of-hull mode: virtual-poles (default), blend[:pow], fade
+  --gain <linear>              Object linear gain [default: 1.0]
+  --freq <hz>                  Test sine wave frequency in Hz [default: 1000.0]
+  --duration <sec>             Test signal duration in seconds [default: 1.0]
+  --sample-rate <hz>           Test signal sample rate in Hz [default: 48000]
+  --headroom-db <db>           Optional static headroom attenuation in dB
+  --normalize-peak <dbfs>      Two-pass global peak normalization target in dBFS (<= 0.0)
+  --lfe-policy <policy>        Missing-LFE policy: drop (default), folddown[:db] (default -3.0 dB)
+  --crossfade-frames <n>       Anti-click Hann crossfade frames on jumps [default: 128]
+  --format <f32|f64>           Output sample format [default: f32]
+  --output <path.wav>          Output WAV/RF64 file path [default: render.wav]
+  -h, --help                   Print help"
     );
 }
 
@@ -84,11 +94,16 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
         interp: InterpMode::Spherical,
         damf_pos: None,
         width: 0.0,
+        divergence: 0.0,
+        near_origin_radius: DEFAULT_NEAR_ORIGIN_RADIUS,
+        out_of_hull: OutOfHullMode::VirtualPoles,
         gain: 1.0,
         freq_hz: 1000.0,
         duration_sec: 1.0,
         sample_rate: 48_000,
         headroom_db: None,
+        normalize_peak: None,
+        lfe_policy: LfePolicy::DropIfAbsent,
         crossfade_frames: 128,
         format: SampleFormat::Float32,
         output: PathBuf::from("render.wav"),
@@ -145,12 +160,27 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
                 ]);
             }
             "--width" => cfg.width = parse_num(&next_val(&mut args, &arg)?, &arg)?,
+            "--divergence" => cfg.divergence = parse_num(&next_val(&mut args, &arg)?, &arg)?,
+            "--near-origin-radius" => {
+                cfg.near_origin_radius = parse_num(&next_val(&mut args, &arg)?, &arg)?
+            }
+            "--out-of-hull" => {
+                let v = next_val(&mut args, &arg)?;
+                cfg.out_of_hull = parse_out_of_hull_mode(&v)?;
+            }
             "--gain" => cfg.gain = parse_num(&next_val(&mut args, &arg)?, &arg)?,
             "--freq" => cfg.freq_hz = parse_num(&next_val(&mut args, &arg)?, &arg)?,
             "--duration" => cfg.duration_sec = parse_num(&next_val(&mut args, &arg)?, &arg)?,
             "--sample-rate" => cfg.sample_rate = parse_num(&next_val(&mut args, &arg)?, &arg)?,
             "--headroom-db" => {
                 cfg.headroom_db = Some(parse_num(&next_val(&mut args, &arg)?, &arg)?)
+            }
+            "--normalize-peak" => {
+                cfg.normalize_peak = Some(parse_num(&next_val(&mut args, &arg)?, &arg)?)
+            }
+            "--lfe-policy" => {
+                let v = next_val(&mut args, &arg)?;
+                cfg.lfe_policy = parse_lfe_policy(&v)?;
             }
             "--crossfade-frames" => {
                 cfg.crossfade_frames = parse_num(&next_val(&mut args, &arg)?, &arg)?
@@ -182,6 +212,52 @@ fn parse_num<T: std::str::FromStr>(raw: &str, flag: &str) -> Result<T, String> {
         .map_err(|_| format!("invalid numeric value `{raw}` for `{flag}`"))
 }
 
+fn parse_out_of_hull_mode(raw: &str) -> Result<OutOfHullMode, String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "virtual-poles" | "virtual_poles" | "poles" => Ok(OutOfHullMode::VirtualPoles),
+        "blend" => Ok(OutOfHullMode::Blend { power: 12.0 }),
+        "fade" => Ok(OutOfHullMode::Fade),
+        _ => {
+            if let Some(rest) = lower.strip_prefix("blend:") {
+                let power: f32 = parse_num(rest, "--out-of-hull blend:<pow>")?;
+                if !power.is_finite() || power < 1.0 {
+                    return Err("--out-of-hull blend power must be finite and >= 1.0".to_string());
+                }
+                Ok(OutOfHullMode::Blend { power })
+            } else {
+                Err(format!(
+                    "unknown --out-of-hull mode `{raw}` (use virtual-poles, blend[:pow], or fade)"
+                ))
+            }
+        }
+    }
+}
+
+fn parse_lfe_policy(raw: &str) -> Result<LfePolicy, String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "drop" | "drop-if-absent" => Ok(LfePolicy::DropIfAbsent),
+        "folddown" | "fold-down" => Ok(LfePolicy::FoldDownIfAbsent { gain_db: -3.0 }),
+        _ => {
+            if let Some(rest) = lower
+                .strip_prefix("folddown:")
+                .or_else(|| lower.strip_prefix("fold-down:"))
+            {
+                let gain_db: f64 = parse_num(rest, "--lfe-policy folddown:<db>")?;
+                if !gain_db.is_finite() {
+                    return Err("--lfe-policy folddown gain_db must be finite".to_string());
+                }
+                Ok(LfePolicy::FoldDownIfAbsent { gain_db })
+            } else {
+                Err(format!(
+                    "unknown --lfe-policy `{raw}` (use drop or folddown[:db])"
+                ))
+            }
+        }
+    }
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let Some(args) = parse_args().map_err(|e| format!("{e}\nUse --help for usage."))? else {
         print_usage();
@@ -211,7 +287,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             pos_z: az,
             gain: args.gain,
             width: args.width,
-            divergence: 0.0,
+            divergence: args.divergence,
             signal: DamfSignalSpec::Sine {
                 freq_hz: args.freq_hz,
                 amplitude: 0.5,
@@ -222,7 +298,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let pos0 = Vec3::from_spherical(SphericalCoord::new(args.az_deg, args.el_deg, args.radius));
         let spatial = SpatialParams {
             width: args.width,
-            divergence: 0.0,
+            divergence: args.divergence,
         };
         let mut obj = AudioObject::static_mono(
             ObjectId(1),
@@ -264,7 +340,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .build()?
     };
 
-    let spatializer = VbapRenderer::build(&layout)?;
+    let spatializer = VbapRenderer::build_with_mode(&layout, args.out_of_hull)?
+        .with_near_origin_radius(args.near_origin_radius);
     let preview_gains = if scene.objects.len() == 1 && scene.objects[0].role != ObjectRole::Lfe {
         let mut gains = vec![0.0_f64; layout.speakers.len()];
         spatializer.compute_gains(
@@ -277,6 +354,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let clipping = match (args.headroom_db, args.normalize_peak) {
+        (Some(_), Some(_)) => {
+            return Err("--headroom-db and --normalize-peak cannot be used together".into());
+        }
+        (Some(db), None) => ClippingPolicy::FixedHeadroomDb(db),
+        (None, Some(target_dbfs)) => ClippingPolicy::TwoPassPeakNormalize { target_dbfs },
+        (None, None) => ClippingPolicy::PassThrough,
+    };
+
     let wave_cfg = WaveConfig::new(
         scene.sample_rate,
         layout.speakers.len() as u16,
@@ -284,10 +370,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.format,
     );
     let writer = WaveWriter::create(&args.output, wave_cfg)?;
-    let clipping = match args.headroom_db {
-        Some(db) => ClippingPolicy::FixedHeadroomDb(db),
-        None => ClippingPolicy::PassThrough,
-    };
 
     let report = render_scene(
         &mut scene,
@@ -297,20 +379,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             block_size: 64,
             crossfade_frames: args.crossfade_frames,
             clipping,
-            lfe_policy: LfePolicy::DropIfAbsent,
+            lfe_policy: args.lfe_policy,
         },
         Box::new(writer),
     )?;
 
+    let gain_suffix = if (report.applied_gain_linear - 1.0).abs() > 1e-6 {
+        format!(", gain={:+.2} dB", report.applied_gain_db())
+    } else {
+        String::new()
+    };
     println!(
-        "Rendered {} frames ({} Hz, {} objects) to {} [layout: {}, {} ch, rf64={}]",
+        "Rendered {} frames ({} Hz, {} objects) to {} [layout: {}, {} ch, rf64={}{}]",
         report.frames_rendered,
         scene.sample_rate,
         scene.objects.len(),
         args.output.display(),
         layout.name,
         layout.speakers.len(),
-        report.rf64_promoted
+        report.rf64_promoted,
+        gain_suffix
     );
     for (idx, ch) in report.channels.iter().enumerate() {
         if let Some(ref gains) = preview_gains {

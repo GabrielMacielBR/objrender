@@ -131,3 +131,24 @@ impl SampleWriter for MemorySink {
         })
     }
 }
+
+/// Zero-allocation no-op sink used during the analysis pass of two-pass rendering.
+#[derive(Debug, Default)]
+pub struct NullWriter {
+    frames_written: u64,
+}
+
+impl SampleWriter for NullWriter {
+    fn write_block(&mut self, _bus: &PcmBus, frames: usize) -> Result<(), IoError> {
+        self.frames_written += frames as u64;
+        Ok(())
+    }
+
+    fn finalize(self: Box<Self>) -> Result<OutputMetadata, IoError> {
+        Ok(OutputMetadata {
+            rf64_promoted: false,
+            frames_written: self.frames_written,
+            total_bytes: 0,
+        })
+    }
+}

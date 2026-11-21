@@ -4,7 +4,7 @@ use std::f64::consts::PI;
 
 use thiserror::Error;
 
-use crate::io::{IoError, OutputMetadata, PcmBus, SampleWriter};
+use crate::io::{IoError, NullWriter, OutputMetadata, PcmBus, SampleWriter};
 use crate::layout::{SpeakerLayout, SpeakerRole};
 use crate::renderer::Spatializer;
 use crate::scene::{ObjectRole, Scene};
@@ -16,6 +16,9 @@ pub enum ClippingPolicy {
     PassThrough,
     /// Applies static attenuation of `headroom_db` dB (e.g., `6.0` scales by `-6 dB`).
     FixedHeadroomDb(f64),
+    /// Renders an analysis pass to measure global peak, then scales all channels
+    /// uniformly so the highest peak reaches `target_dbfs` (must be finite and `<= 0.0`).
+    TwoPassPeakNormalize { target_dbfs: f64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,8 +80,19 @@ impl ChannelStats {
 pub struct RenderReport {
     pub frames_rendered: u64,
     pub rf64_promoted: bool,
+    pub applied_gain_linear: f64,
     pub output_metadata: OutputMetadata,
     pub channels: Vec<ChannelStats>,
+}
+
+impl RenderReport {
+    pub fn applied_gain_db(&self) -> f64 {
+        if self.applied_gain_linear <= 0.0 {
+            f64::NEG_INFINITY
+        } else {
+            20.0 * self.applied_gain_linear.log10()
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -115,7 +129,7 @@ pub fn render_scene(
     layout: &SpeakerLayout,
     spatializer: &dyn Spatializer,
     config: RenderConfig,
-    mut writer: Box<dyn SampleWriter>,
+    writer: Box<dyn SampleWriter>,
 ) -> Result<RenderReport, RenderError> {
     if config.block_size == 0 {
         return Err(RenderError::InvalidConfig(
@@ -129,7 +143,65 @@ pub fn render_scene(
             spatializer.num_speakers()
         )));
     }
+    if let LfePolicy::FoldDownIfAbsent { gain_db } = config.lfe_policy
+        && !gain_db.is_finite()
+    {
+        return Err(RenderError::InvalidConfig(
+            "FoldDownIfAbsent gain_db must be finite".to_string(),
+        ));
+    }
 
+    match config.clipping {
+        ClippingPolicy::PassThrough => {
+            run_render_pass(scene, layout, spatializer, config, 1.0, writer)
+        }
+        ClippingPolicy::FixedHeadroomDb(db) => {
+            if !db.is_finite() || db < 0.0 {
+                return Err(RenderError::InvalidConfig(
+                    "FixedHeadroomDb must be finite and >= 0.0".to_string(),
+                ));
+            }
+            let scale = 10.0_f64.powf(-db / 20.0);
+            run_render_pass(scene, layout, spatializer, config, scale, writer)
+        }
+        ClippingPolicy::TwoPassPeakNormalize { target_dbfs } => {
+            if !target_dbfs.is_finite() || target_dbfs > 0.0 {
+                return Err(RenderError::InvalidConfig(
+                    "TwoPassPeakNormalize target_dbfs must be finite and <= 0.0".to_string(),
+                ));
+            }
+            let analysis = run_render_pass(
+                scene,
+                layout,
+                spatializer,
+                config,
+                1.0,
+                Box::new(NullWriter::default()),
+            )?;
+            let max_peak = analysis
+                .channels
+                .iter()
+                .map(|c| c.peak_linear)
+                .fold(0.0_f64, f64::max);
+            let norm_scale = if max_peak <= 1e-12 {
+                1.0
+            } else {
+                10.0_f64.powf(target_dbfs / 20.0) / max_peak
+            };
+            run_render_pass(scene, layout, spatializer, config, norm_scale, writer)
+        }
+    }
+}
+
+fn run_render_pass(
+    scene: &mut Scene,
+    layout: &SpeakerLayout,
+    spatializer: &dyn Spatializer,
+    config: RenderConfig,
+    output_scale: f64,
+    mut writer: Box<dyn SampleWriter>,
+) -> Result<RenderReport, RenderError> {
+    let n_spk = layout.speakers.len();
     let lfe_channels: Vec<usize> = layout
         .speakers
         .iter()
@@ -144,18 +216,6 @@ pub fn render_scene(
         .filter(|(_, s)| s.role == SpeakerRole::FullRange)
         .map(|(i, _)| i)
         .collect();
-
-    let headroom_scale = match config.clipping {
-        ClippingPolicy::PassThrough => 1.0,
-        ClippingPolicy::FixedHeadroomDb(db) => {
-            if !db.is_finite() || db < 0.0 {
-                return Err(RenderError::InvalidConfig(
-                    "FixedHeadroomDb must be finite and >= 0.0".to_string(),
-                ));
-            }
-            10.0_f64.powf(-db / 20.0)
-        }
-    };
 
     let mut bus = PcmBus::new(n_spk, config.block_size);
     let mut mono_buf = vec![0.0_f64; config.block_size];
@@ -274,10 +334,10 @@ pub fn render_scene(
             obj_state.initialized = true;
         }
 
-        if (headroom_scale - 1.0).abs() > f64::EPSILON {
+        if (output_scale - 1.0).abs() > f64::EPSILON {
             for ch in 0..n_spk {
                 for sample in &mut bus.channel_mut(ch)[..n_frames] {
-                    *sample *= headroom_scale;
+                    *sample *= output_scale;
                 }
             }
         }
@@ -303,6 +363,7 @@ pub fn render_scene(
     Ok(RenderReport {
         frames_rendered: scene.total_frames,
         rf64_promoted: output_metadata.rf64_promoted,
+        applied_gain_linear: output_scale,
         output_metadata,
         channels: stats,
     })

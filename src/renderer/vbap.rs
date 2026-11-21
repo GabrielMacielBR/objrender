@@ -16,6 +16,10 @@ thread_local! {
         RefCell::new((Vbap3dScratch::new(0), Vec::new()));
 }
 
+/// Default radius around the origin within which directional panning smoothly
+/// blends toward an omnidirectional field across full-range speakers.
+pub const DEFAULT_NEAR_ORIGIN_RADIUS: f64 = 0.15;
+
 #[derive(Debug, Clone)]
 struct Pair2D {
     vert_a: usize,
@@ -48,6 +52,7 @@ pub struct VbapRenderer {
     num_total_speakers: usize,
     full_range_channels: Vec<usize>,
     full_range_dirs: Vec<Vec3>,
+    near_origin_radius: f64,
     backend: VbapBackend,
 }
 
@@ -63,6 +68,16 @@ impl VbapRenderer {
         mode: OutOfHullMode,
     ) -> Result<Self, LayoutError> {
         layout.validate()?;
+        let mode = match mode {
+            OutOfHullMode::Blend { power } => OutOfHullMode::Blend {
+                power: if power.is_finite() {
+                    power.max(1.0)
+                } else {
+                    12.0
+                },
+            },
+            other => other,
+        };
 
         let mut full_range_channels = Vec::new();
         let mut full_range_dirs = Vec::new();
@@ -117,8 +132,25 @@ impl VbapRenderer {
             num_total_speakers: layout.speakers.len(),
             full_range_channels,
             full_range_dirs,
+            near_origin_radius: DEFAULT_NEAR_ORIGIN_RADIUS,
             backend,
         })
+    }
+
+    /// Sets the inner radius within which directional gains smoothly transition to an
+    /// omnidirectional field (`0.0` disables the blend).
+    pub fn with_near_origin_radius(mut self, radius: f64) -> Self {
+        self.near_origin_radius = if radius.is_finite() {
+            radius.max(0.0)
+        } else {
+            DEFAULT_NEAR_ORIGIN_RADIUS
+        };
+        self
+    }
+
+    #[inline]
+    pub fn near_origin_radius(&self) -> f64 {
+        self.near_origin_radius
     }
 
     fn fill_omnidirectional(&self, out_gains: &mut [f64]) {
@@ -244,11 +276,55 @@ impl Spatializer for VbapRenderer {
                 });
 
                 let sum_sq: f64 = out_gains.iter().map(|g| g * g).sum();
-                if sum_sq <= 1e-18 {
+                if matches!(mode, OutOfHullMode::Fade) {
+                    // Fade mode intentionally attenuates toward zero at uncovered poles.
+                } else if sum_sq <= 1e-18 {
                     let dir = position * (1.0 / r);
                     self.fallback_nearest_speaker(dir, out_gains);
-                } else if !matches!(mode, OutOfHullMode::Fade) {
+                } else {
                     normalize_l2(out_gains);
+                }
+            }
+        }
+
+        let n_fr = self.full_range_channels.len();
+        let div = params.divergence.clamp(0.0, 1.0);
+        if n_fr > 1 && div > 1e-9 {
+            let energy_dir: f64 = self
+                .full_range_channels
+                .iter()
+                .map(|&ch| out_gains[ch] * out_gains[ch])
+                .sum();
+            let omni_power = energy_dir / (n_fr as f64);
+            for &ch in &self.full_range_channels {
+                let g_sq = (1.0 - div) * out_gains[ch] * out_gains[ch] + div * omni_power;
+                out_gains[ch] = g_sq.max(0.0).sqrt();
+            }
+        }
+
+        if n_fr > 1 && self.near_origin_radius > 0.0 && r < self.near_origin_radius {
+            let alpha = crate::math::smoothstep(0.0, self.near_origin_radius, r);
+            let norm_dir: f64 = self
+                .full_range_channels
+                .iter()
+                .map(|&ch| out_gains[ch] * out_gains[ch])
+                .sum::<f64>()
+                .sqrt();
+            let omni_g = 1.0 / (n_fr as f64).sqrt();
+            for &ch in &self.full_range_channels {
+                out_gains[ch] = (1.0 - alpha) * omni_g + alpha * out_gains[ch];
+            }
+            let target_norm = (1.0 - alpha) * 1.0 + alpha * norm_dir;
+            let cur_norm: f64 = self
+                .full_range_channels
+                .iter()
+                .map(|&ch| out_gains[ch] * out_gains[ch])
+                .sum::<f64>()
+                .sqrt();
+            if cur_norm > 1e-12 && cur_norm.is_finite() {
+                let scale = target_norm / cur_norm;
+                for &ch in &self.full_range_channels {
+                    out_gains[ch] *= scale;
                 }
             }
         }

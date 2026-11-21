@@ -546,9 +546,12 @@ impl TrackTimeline {
             self.linear_gain = db_to_linear(gain.0);
         }
         if let Some([sx, sy, sz]) = ev.size_3d {
-            self.spatial.width = ((sx + sy + sz) / 3.0).clamp(0.0, 1.0);
+            self.spatial.width = ((sx * sx + sy * sy + sz * sz) / 3.0).sqrt().clamp(0.0, 1.0);
         } else if let Some(size) = ev.size {
             self.spatial.width = size.clamp(0.0, 1.0);
+        }
+        if let Some(div) = ev.divergence {
+            self.spatial.divergence = div.clamp(0.0, 1.0);
         }
 
         let new_gain = self.effective_gain();
@@ -682,6 +685,8 @@ struct DamfEvent {
     size: Option<f64>,
     #[serde(default, rename = "size3D")]
     size_3d: Option<[f64; 3]>,
+    #[serde(default)]
+    divergence: Option<f64>,
     #[serde(default)]
     gain: Option<DamfGain>,
     #[serde(default)]
