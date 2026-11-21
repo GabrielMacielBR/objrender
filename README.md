@@ -36,7 +36,7 @@ An open-source, offline 3D object-based spatial audio renderer written in safe R
 
 ## Building
 
-Requires a Rust toolchain supporting **Edition 2024** (or download prebuilt archives for Windows x64, Linux x64, and macOS Universal/arm64/x64 with `SHA256SUMS.txt` from [GitHub Releases](https://github.com/GabrielMacielBR/objrender/releases)).
+Requires a Rust toolchain supporting **Edition 2024** (or download prebuilt archives for Windows x64, Linux x64, and macOS arm64/x64 with `SHA256SUMS.txt` from [GitHub Releases](https://github.com/GabrielMacielBR/objrender/releases)).
 
 ```sh
 git clone https://github.com/GabrielMacielBR/objrender.git
@@ -79,7 +79,7 @@ harletty decode --output-path damf_out/ audio.eac3
   --format i24 \
   --output - | ffmpeg -i - -c:a flac -compression_level 8 render_3_1_2.flac
 
-# 64-bit float output for 9.1.6 using SMPTE surround order (7.1.4 example below) and folded LFE
+# 4.0 (Quad) 32-bit float output using 4 threads with LFE folded down at -3.0 dB
 ./target/release/objrender \
   --damf damf_out/master.atmos \
   --layout 4.0 \
