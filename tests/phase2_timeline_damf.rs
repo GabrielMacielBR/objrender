@@ -387,9 +387,10 @@ events:
     // Check LFE bed channel at frame 50: exact 0.5 on ch 3.
     assert_relative_eq!(decoded[50 * 12 + 3], 0.5_f32, epsilon = 1e-4);
 
-    // At frame 50 (before ramp): object 10 is at [-1, 1, 0] (+45 deg Front-Left, between L +30 and Lss +90),
-    // so L (ch 0) > 0.3 and R (ch 1) == 0.0, while Center (ch 2) carries only bed C = 0.25.
-    assert!(decoded[50 * 12] > 0.3);
+    // At frame 50 (before ramp): object 10 is at [-1, 1, 0], projected to +30 deg (exact L),
+    // so L (ch 0) == 0.5, Lss (ch 6) == 0.0, R (ch 1) == 0.0, while Center (ch 2) carries only bed C = 0.25.
+    assert_relative_eq!(decoded[50 * 12], 0.5_f32, epsilon = 1e-3);
+    assert_relative_eq!(decoded[50 * 12 + 6], 0.0_f32, epsilon = 1e-4);
     assert_relative_eq!(decoded[50 * 12 + 1], 0.0_f32, epsilon = 1e-4);
     assert_relative_eq!(decoded[50 * 12 + 2], 0.25_f32, epsilon = 1e-4);
 
@@ -397,9 +398,10 @@ events:
     // Center (ch 2) carries bed C (0.25) + object 10 (0.5) = 0.75!
     assert_relative_eq!(decoded[256 * 12 + 2], 0.75_f32, epsilon = 2e-2);
 
-    // At frame 450 (after ramp ends at 384): object 10 is at [1, 1, 0] (Front-Right),
-    // so R (ch 1) > 0.3, L (ch 0) == 0.0, and Center (ch 2) returns to 0.25.
-    assert!(decoded[450 * 12 + 1] > 0.3);
+    // At frame 450 (after ramp ends at 384): object 10 is at [1, 1, 0], projected to -30 deg (exact R),
+    // so R (ch 1) == 0.5, Rss (ch 7) == 0.0, L (ch 0) == 0.0, and Center (ch 2) returns to 0.25.
+    assert_relative_eq!(decoded[450 * 12 + 1], 0.5_f32, epsilon = 1e-3);
+    assert_relative_eq!(decoded[450 * 12 + 7], 0.0_f32, epsilon = 1e-4);
     assert_relative_eq!(decoded[450 * 12], 0.0_f32, epsilon = 1e-4);
     assert_relative_eq!(decoded[450 * 12 + 2], 0.25_f32, epsilon = 1e-4);
 
@@ -457,4 +459,140 @@ events:
     let at_100 = objrender::timeline::eval_at(&scene.objects[0], 100);
     assert_relative_eq!(at_100.gain, 1.0, epsilon = 1e-6);
     assert_relative_eq!(at_100.position.x, 1.0, epsilon = 1e-6);
+}
+
+#[test]
+fn eac3_joc_damf_skips_core_downmix_channels_and_maps_objects_accurately() {
+    let n_frames = 64usize;
+    let sr = 48_000u32;
+
+    // 21-channel harletty EAC3-JOC CAF layout:
+    //   ch 0..5  : 5.0 fullband core downmix (decoys that must be skipped)
+    //   ch 5     : core LFE (ID 3) = 0.25
+    //   ch 6     : ID 10 at [-1, 1, 0] (L) = 0.5
+    //   ch 9     : ID 13 at [1, 1, 0] (R) = 0.4
+    //   ch 10    : ID 14 at [-1, -1, 0] (Lrs) = 0.3
+    //   ch 12    : ID 16 at [-1, 0, 1] (Ltf/Ltr) = 0.2
+    let mut channels = vec![vec![0.0_f64; n_frames]; 21];
+    channels[0] = vec![0.9; n_frames];
+    channels[1] = vec![0.8; n_frames];
+    channels[2] = vec![0.7; n_frames];
+    channels[3] = vec![0.6; n_frames];
+    channels[4] = vec![0.5; n_frames];
+    channels[5] = vec![0.25; n_frames];
+    channels[6] = vec![0.5; n_frames];
+    channels[9] = vec![0.4; n_frames];
+    channels[10] = vec![0.3; n_frames];
+    channels[12] = vec![0.2; n_frames];
+
+    let caf_bytes = build_caf_24le(sr, &channels);
+    let shared = SharedCafStream::from_reader(Cursor::new(caf_bytes)).unwrap();
+
+    let mut manifest_yaml = String::from(
+        r#"version: 0.5.1
+presentations:
+  - type: home
+    simplified: false
+    metadata: joc.atmos.metadata
+    audio: joc.atmos.audio
+    offset: 0.0
+    sourceCodec: EAC3-JOC
+    bedInstances:
+      - channels:
+          - channel: LFE
+            ID: 3
+    objects:
+"#,
+    );
+    for id in 10..=24 {
+        manifest_yaml.push_str(&format!("      - ID: {id}\n"));
+    }
+
+    let metadata_yaml = r#"sampleRate: 48000
+events:
+  - ID: 3
+    samplePos: 0
+    active: true
+    gain: 0
+    rampLength: 0
+  - ID: 10
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    gain: 0
+    rampLength: 0
+  - ID: 13
+    samplePos: 0
+    active: true
+    pos: [1, 1, 0]
+    gain: 0
+    rampLength: 0
+  - ID: 14
+    samplePos: 0
+    active: true
+    pos: [-1, -1, 0]
+    gain: 0
+    rampLength: 0
+  - ID: 16
+    samplePos: 0
+    active: true
+    pos: [-1, 0, 1]
+    gain: 0
+    rampLength: 0
+"#;
+
+    let mut scene = DamfImporter::from_parts(&manifest_yaml, metadata_yaml, shared).unwrap();
+    let layout = SpeakerLayout::layout_7_1_4();
+    let vbap = VbapRenderer::build(&layout).unwrap();
+
+    let out_wav = std::env::temp_dir().join(format!("objrender_joc_{}.wav", std::process::id()));
+    render_scene(
+        &mut scene,
+        &layout,
+        &vbap,
+        RenderConfig {
+            block_size: 64,
+            crossfade_frames: 0,
+            clipping: ClippingPolicy::PassThrough,
+            lfe_policy: LfePolicy::DropIfAbsent,
+        },
+        Box::new(
+            WaveWriter::create(
+                &out_wav,
+                WaveConfig::new(sr, 12, layout.channel_mask(), SampleFormat::Float32),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let decoded: Vec<f32> = hound::WavReader::open(&out_wav)
+        .unwrap()
+        .samples::<f32>()
+        .map(|s| s.unwrap())
+        .collect();
+    let _ = fs::remove_file(&out_wav);
+
+    let f = 32 * 12;
+    // ID 16 at [-1, 0, 1] maps to (az=+90, el=+45), which lies inside the 3D triangle
+    // (Ltf, Ltr, Lss) because the geodesic midpoint of Ltf (+45, +45) and Ltr (+135, +45)
+    // rises to el = atan(sqrt(2)) = 54.74 deg; verify symmetric Ltf/Ltr split and exact L2 energy.
+    let s2 = std::f64::consts::SQRT_2;
+    let unnorm_lss = s2 - 1.0;
+    let inv_vbap_norm = 0.2 / (2.0 + unnorm_lss * unnorm_lss).sqrt();
+    let expected_top = inv_vbap_norm as f32;
+    let expected_lss = (unnorm_lss * inv_vbap_norm) as f32;
+
+    assert_relative_eq!(decoded[f], 0.5_f32, epsilon = 1e-3); // L
+    assert_relative_eq!(decoded[f + 1], 0.4_f32, epsilon = 1e-3); // R
+    assert_relative_eq!(decoded[f + 2], 0.0_f32, epsilon = 1e-4); // C
+    assert_relative_eq!(decoded[f + 3], 0.25_f32, epsilon = 1e-4); // LFE
+    assert_relative_eq!(decoded[f + 4], 0.3_f32, epsilon = 1e-3); // Lrs
+    assert_relative_eq!(decoded[f + 5], 0.0_f32, epsilon = 1e-4); // Rrs
+    assert_relative_eq!(decoded[f + 6], expected_lss, epsilon = 1e-3); // Lss
+    assert_relative_eq!(decoded[f + 7], 0.0_f32, epsilon = 1e-4); // Rss
+    assert_relative_eq!(decoded[f + 8], expected_top, epsilon = 1e-3); // Ltf
+    assert_relative_eq!(decoded[f + 9], 0.0_f32, epsilon = 1e-4); // Rtf
+    assert_relative_eq!(decoded[f + 10], expected_top, epsilon = 1e-3); // Ltr
+    assert_relative_eq!(decoded[f + 11], 0.0_f32, epsilon = 1e-4); // Rtr
 }

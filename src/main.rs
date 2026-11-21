@@ -253,14 +253,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let spatializer = VbapRenderer::build(&layout)?;
-    let mut preview_gains = vec![0.0_f64; layout.speakers.len()];
-    if let Some(first_obj) = scene.objects.first() {
+    let preview_gains = if scene.objects.len() == 1 && scene.objects[0].role != ObjectRole::Lfe {
+        let mut gains = vec![0.0_f64; layout.speakers.len()];
         spatializer.compute_gains(
-            first_obj.initial_position,
-            first_obj.initial_spatial,
-            &mut preview_gains,
+            scene.objects[0].initial_position,
+            scene.objects[0].initial_spatial,
+            &mut gains,
         );
-    }
+        Some(gains)
+    } else {
+        None
+    };
 
     let wave_cfg = WaveConfig::new(
         scene.sample_rate,
@@ -298,14 +301,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         report.rf64_promoted
     );
     for (idx, ch) in report.channels.iter().enumerate() {
-        println!(
-            "  ch {:02} ({:<4}): initial_gain={:.4}  peak={:.2} dBFS  rms={:.2} dBFS",
-            idx,
-            ch.speaker_label,
-            preview_gains[idx],
-            ch.peak_dbfs(),
-            ch.rms_dbfs(report.frames_rendered)
-        );
+        if let Some(ref gains) = preview_gains {
+            println!(
+                "  ch {:02} ({:<4}): initial_gain={:.4}  peak={:.2} dBFS  rms={:.2} dBFS",
+                idx,
+                ch.speaker_label,
+                gains[idx],
+                ch.peak_dbfs(),
+                ch.rms_dbfs(report.frames_rendered)
+            );
+        } else {
+            println!(
+                "  ch {:02} ({:<4}): peak={:7.2} dBFS  rms={:7.2} dBFS",
+                idx,
+                ch.speaker_label,
+                ch.peak_dbfs(),
+                ch.rms_dbfs(report.frames_rendered)
+            );
+        }
     }
 
     Ok(())

@@ -22,13 +22,57 @@ use crate::scene::{
     ObjectRole, Scene, SceneBuilder, SineSource, SpatialParams,
 };
 
-/// Translates normalized OAMD `[0, 1]` room-cube coordinates `(ax, ay, az)` into core space.
+/// Translates normalized OAMD `[0, 1]` room-cube coordinates `(ax, ay, az)` into spherical-mapped
+/// core space.
 ///
 /// Note: `truehdd` / `harletty` `.atmos.metadata` YAML files already convert `pos` to `[-1, +1]`
 /// listener-centered coordinates; use this helper only when consuming raw `[0, 1]` OAMD cubes.
 #[inline]
 pub fn damf_cube_to_core(ax: f64, ay: f64, az: f64) -> Vec3 {
-    Vec3::new(2.0 * ax - 1.0, 1.0 - 2.0 * ay, az)
+    room_cube_to_sphere(Vec3::new(2.0 * ax - 1.0, 1.0 - 2.0 * ay, az))
+}
+
+const SPHERE_FRONT_CORNER_DEG: f64 = 30.0;
+const SPHERE_TOP_FRONT_CORNER_DEG: f64 = 45.0;
+const SPHERE_REAR_CORNER_DEG: f64 = 135.0;
+
+#[inline]
+fn sphere_front_corner_deg(height: f64) -> f64 {
+    SPHERE_FRONT_CORNER_DEG + (SPHERE_TOP_FRONT_CORNER_DEG - SPHERE_FRONT_CORNER_DEG) * height
+}
+
+/// Projects listener-centered DAMF room-cube coordinates `[-1, 1]^3` onto the
+/// nominal listener sphere so cube corners land on ITU / Atmos nominal speaker
+/// angles (`L/R` at `+-30 deg`, `Lss/Rss` at `+-90 deg`, `Lrs/Rrs` at `+-135 deg`,
+/// `Ltf/Rtf` at `+-45 deg / +45 deg`, `Ltr/Rtr` at `+-135 deg / +45 deg`, and
+/// ceiling edges at `+45 deg` elevation).
+///
+/// Adapted from `mgth/Omniphony` (`omniphony_geometry::sphere_reading`, GPL-3.0-or-later).
+#[inline]
+pub fn room_cube_to_sphere(pos: Vec3) -> Vec3 {
+    let reach = pos.x.abs().max(pos.y.abs());
+    if reach <= 0.0 {
+        return pos;
+    }
+    let (ux, uy) = (pos.x.abs() / reach, pos.y / reach);
+    let front = sphere_front_corner_deg((pos.z.abs() / reach).min(1.0));
+    let azimuth = if uy >= ux {
+        front * ux
+    } else if uy <= -ux {
+        180.0 - (180.0 - SPHERE_REAR_CORNER_DEG) * ux
+    } else if uy >= 0.0 {
+        90.0 - (90.0 - front) * uy
+    } else {
+        90.0 - (SPHERE_REAR_CORNER_DEG - 90.0) * uy
+    };
+    let (sin, cos) = azimuth.to_radians().sin_cos();
+    let heard = [reach * sin.copysign(pos.x), reach * cos, pos.z];
+    let max_heard = heard[0].abs().max(heard[1].abs()).max(heard[2].abs());
+    if max_heard <= 0.0 {
+        return pos;
+    }
+    let scale = reach.max(pos.z.abs()) / max_heard;
+    Vec3::new(heard[0] * scale, heard[1] * scale, heard[2] * scale)
 }
 
 #[derive(Debug, Clone)]
@@ -153,14 +197,13 @@ impl DamfImporter {
             )));
         }
 
-        let mut specs = build_track_specs(presentation)?;
-        if specs.len() > caf_info.num_channels {
-            return Err(ImportError::InvalidDescriptor(format!(
-                "DAMF manifest declares {} channels, but CAF stream only has {}",
-                specs.len(),
-                caf_info.num_channels
-            )));
-        }
+        let (mut specs, bed_count) = build_track_specs(presentation)?;
+        let caf_channels = resolve_caf_channels(
+            presentation.source_codec.as_deref(),
+            &specs,
+            bed_count,
+            caf_info.num_channels,
+        )?;
 
         let mut tracks_by_id: HashMap<u32, usize> = HashMap::with_capacity(specs.len());
         for (idx, spec) in specs.iter().enumerate() {
@@ -184,7 +227,9 @@ impl DamfImporter {
         }
 
         let mut builder = SceneBuilder::new(sample_rate, caf_info.total_frames);
-        for (caf_channel, (spec, track)) in specs.drain(..).zip(states).enumerate() {
+        for (caf_channel, (spec, track)) in
+            caf_channels.into_iter().zip(specs.drain(..).zip(states))
+        {
             let source: Box<dyn AudioSource> =
                 Box::new(CafChannelSource::new(Arc::clone(&caf_stream), caf_channel)?);
             let mut obj = AudioObject::static_mono(
@@ -258,7 +303,7 @@ struct TrackSpec {
     initial_pos: Vec3,
 }
 
-fn build_track_specs(pres: &DamfPresentation) -> Result<Vec<TrackSpec>, ImportError> {
+fn build_track_specs(pres: &DamfPresentation) -> Result<(Vec<TrackSpec>, usize), ImportError> {
     let mut specs = Vec::new();
     for bed in &pres.bed_instances {
         for ch in &bed.channels {
@@ -273,6 +318,7 @@ fn build_track_specs(pres: &DamfPresentation) -> Result<Vec<TrackSpec>, ImportEr
             });
         }
     }
+    let bed_count = specs.len();
     for obj in &pres.objects {
         let label = obj
             .description
@@ -291,7 +337,99 @@ fn build_track_specs(pres: &DamfPresentation) -> Result<Vec<TrackSpec>, ImportEr
             "DAMF presentation declares zero beds or objects".into(),
         ));
     }
-    Ok(specs)
+    Ok((specs, bed_count))
+}
+
+fn resolve_caf_channels(
+    source_codec: Option<&str>,
+    specs: &[TrackSpec],
+    bed_count: usize,
+    caf_channels: usize,
+) -> Result<Vec<usize>, ImportError> {
+    if specs.len() > caf_channels {
+        return Err(ImportError::InvalidDescriptor(format!(
+            "DAMF manifest declares {} channels, but CAF stream only has {}",
+            specs.len(),
+            caf_channels
+        )));
+    }
+
+    if source_codec.is_some_and(|c| c.eq_ignore_ascii_case("EAC3-JOC")) {
+        // harletty writes E-AC-3 JOC CAF streams as `[core_fullband..., optional LFE, objects...]`.
+        let object_count = specs.len() - bed_count;
+        let core_total = caf_channels - object_count;
+        let beds = &specs[..bed_count];
+        let mut mapping = Vec::with_capacity(specs.len());
+
+        if bed_count == 1 && beds[0].role == ObjectRole::Lfe {
+            if core_total == 0 {
+                return Err(ImportError::InvalidDescriptor(
+                    "EAC3-JOC stream declares LFE bed but CAF has zero core channels".into(),
+                ));
+            }
+            mapping.push(core_total - 1);
+        } else if bed_count > 0 {
+            let explicit = map_eac3_bed_channels(beds, core_total);
+            if core_total == bed_count {
+                match explicit {
+                    Some(indices) => mapping.extend(indices),
+                    None => mapping.extend(0..bed_count),
+                }
+            } else {
+                let indices = explicit.ok_or_else(|| {
+                    ImportError::InvalidDescriptor(format!(
+                        "unable to map {bed_count} DAMF bed channels onto {core_total} EAC3-JOC core channels"
+                    ))
+                })?;
+                mapping.extend(indices);
+            }
+        }
+
+        for k in 0..object_count {
+            mapping.push(core_total + k);
+        }
+        return Ok(mapping);
+    }
+
+    Ok((0..specs.len()).collect())
+}
+
+fn map_eac3_bed_channels(beds: &[TrackSpec], core_total: usize) -> Option<Vec<usize>> {
+    let has_lfe = beds.iter().any(|b| b.role == ObjectRole::Lfe);
+    if has_lfe && core_total == 0 {
+        return None;
+    }
+    let fullband_limit = if has_lfe { core_total - 1 } else { core_total };
+    let mut used = vec![false; core_total];
+    let mut out = Vec::with_capacity(beds.len());
+
+    for bed in beds {
+        let slot = if bed.role == ObjectRole::Lfe {
+            core_total - 1
+        } else {
+            let s = match bed.label.trim().to_ascii_uppercase().as_str() {
+                "L" => 0,
+                "C" => 1,
+                "R" => 2,
+                "LS" | "LSS" => 3,
+                "RS" | "RSS" => 4,
+                "LB" | "LRS" => 5,
+                "RB" | "RRS" => 6,
+                _ => return None,
+            };
+            if s >= fullband_limit {
+                return None;
+            }
+            s
+        };
+        if used[slot] {
+            return None;
+        }
+        used[slot] = true;
+        out.push(slot);
+    }
+
+    Some(out)
 }
 
 fn bed_label_to_role_and_pos(label: &str) -> Option<(ObjectRole, Vec3)> {
@@ -311,8 +449,8 @@ fn bed_label_to_role_and_pos(label: &str) -> Option<(ObjectRole, Vec3)> {
         "RSS" => (-90.0, 0.0),
         "LS" => (110.0, 0.0),
         "RS" => (-110.0, 0.0),
-        "LRS" | "LB" => (140.0, 0.0),
-        "RRS" | "RB" => (-140.0, 0.0),
+        "LRS" | "LB" => (135.0, 0.0),
+        "RRS" | "RB" => (-135.0, 0.0),
         "CS" | "CB" => (180.0, 0.0),
         "LTF" => (45.0, 45.0),
         "RTF" => (-45.0, 45.0),
@@ -332,9 +470,11 @@ fn bed_label_to_role_and_pos(label: &str) -> Option<(ObjectRole, Vec3)> {
 }
 
 struct TrackTimeline {
+    raw_pos: Option<Vec3>,
     pos: Vec3,
     linear_gain: f64,
     active: bool,
+    elevation_enabled: bool,
     spatial: SpatialParams,
     keyframes: Vec<Keyframe>,
 }
@@ -342,9 +482,11 @@ struct TrackTimeline {
 impl TrackTimeline {
     fn new(initial_pos: Vec3) -> Self {
         Self {
+            raw_pos: None,
             pos: initial_pos,
             linear_gain: 1.0,
             active: true,
+            elevation_enabled: true,
             spatial: SpatialParams::default(),
             keyframes: Vec::new(),
         }
@@ -386,8 +528,19 @@ impl TrackTimeline {
         if let Some(active) = ev.active {
             self.active = active;
         }
+        if let Some(elev) = ev.elevation {
+            self.elevation_enabled = elev;
+        }
         if let Some([x, y, z]) = ev.pos {
-            self.pos = Vec3::new(x, y, z);
+            let raw = Vec3::new(x, y, z);
+            self.raw_pos = Some(raw);
+            let z_eff = if self.elevation_enabled { raw.z } else { 0.0 };
+            self.pos = room_cube_to_sphere(Vec3::new(raw.x, raw.y, z_eff));
+        } else if ev.elevation.is_some()
+            && let Some(raw) = self.raw_pos
+        {
+            let z_eff = if self.elevation_enabled { raw.z } else { 0.0 };
+            self.pos = room_cube_to_sphere(Vec3::new(raw.x, raw.y, z_eff));
         }
         if let Some(gain) = ev.gain {
             self.linear_gain = db_to_linear(gain.0);
@@ -473,6 +626,8 @@ struct DamfPresentation {
     metadata: String,
     audio: String,
     #[serde(default)]
+    source_codec: Option<String>,
+    #[serde(default)]
     bed_instances: Vec<DamfBedInstance>,
     #[serde(default)]
     objects: Vec<DamfObjectRef>,
@@ -521,6 +676,8 @@ struct DamfEvent {
     active: Option<bool>,
     #[serde(default)]
     pos: Option<[f64; 3]>,
+    #[serde(default)]
+    elevation: Option<bool>,
     #[serde(default)]
     size: Option<f64>,
     #[serde(default, rename = "size3D")]
@@ -573,5 +730,45 @@ impl<'de> Deserialize<'de> for DamfGain {
             }
         }
         deserializer.deserialize_any(GainVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_relative_eq;
+
+    #[test]
+    fn room_cube_to_sphere_maps_nominal_corners_and_edges() {
+        let cases = [
+            (Vec3::new(-1.0, 1.0, 0.0), 30.0, 0.0),
+            (Vec3::new(1.0, 1.0, 0.0), -30.0, 0.0),
+            (Vec3::new(-1.0, 1.0, 1.0), 45.0, 45.0),
+            (Vec3::new(1.0, 1.0, 1.0), -45.0, 45.0),
+            (Vec3::new(-1.0, 0.0, 0.0), 90.0, 0.0),
+            (Vec3::new(1.0, 0.0, 0.0), -90.0, 0.0),
+            (Vec3::new(-1.0, 0.0, 1.0), 90.0, 45.0),
+            (Vec3::new(1.0, 0.0, 1.0), -90.0, 45.0),
+            (Vec3::new(-1.0, -1.0, 0.0), 135.0, 0.0),
+            (Vec3::new(1.0, -1.0, 0.0), -135.0, 0.0),
+            (Vec3::new(-1.0, -1.0, 1.0), 135.0, 45.0),
+            (Vec3::new(1.0, -1.0, 1.0), -135.0, 45.0),
+            (Vec3::new(0.0, 1.0, 0.0), 0.0, 0.0),
+        ];
+
+        for (cube_pos, expected_az, expected_el) in cases {
+            let mapped = room_cube_to_sphere(cube_pos);
+            let sph = mapped.to_spherical();
+            assert_relative_eq!(sph.azimuth_deg, expected_az, epsilon = 1e-9);
+            assert_relative_eq!(sph.elevation_deg, expected_el, epsilon = 1e-9);
+        }
+
+        let zenith = room_cube_to_sphere(Vec3::new(0.0, 0.0, 1.0));
+        assert_relative_eq!(zenith.to_spherical().elevation_deg, 90.0, epsilon = 1e-9);
+
+        let origin = room_cube_to_sphere(Vec3::ZERO);
+        assert_relative_eq!(origin.x, 0.0, epsilon = 1e-12);
+        assert_relative_eq!(origin.y, 0.0, epsilon = 1e-12);
+        assert_relative_eq!(origin.z, 0.0, epsilon = 1e-12);
     }
 }
