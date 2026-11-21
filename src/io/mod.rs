@@ -1,5 +1,6 @@
 //! Planar mixing bus, sample format conversions, and streaming output writer traits.
 
+pub mod interleave;
 pub mod wave;
 
 use thiserror::Error;
@@ -75,6 +76,16 @@ impl PcmBus {
     #[inline]
     pub fn channel_mut(&mut self, ch: usize) -> &mut [f64] {
         &mut self.channels[ch]
+    }
+
+    #[inline]
+    pub fn channels(&self) -> &[Vec<f64>] {
+        &self.channels
+    }
+
+    #[inline]
+    pub fn channels_mut(&mut self) -> &mut [Vec<f64>] {
+        &mut self.channels
     }
 }
 

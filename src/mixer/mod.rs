@@ -1,5 +1,7 @@
 //! Offline multi-object mixing, timeline ramping, LFE routing, and render orchestration.
 
+pub mod simd;
+
 use std::f64::consts::PI;
 
 use thiserror::Error;
@@ -217,6 +219,7 @@ fn run_render_pass(
         .map(|(i, _)| i)
         .collect();
 
+    let arch = pulp::Arch::new();
     let mut bus = PcmBus::new(n_spk, config.block_size);
     let mut mono_buf = vec![0.0_f64; config.block_size];
     let mut gains0 = vec![0.0_f64; n_spk];
@@ -318,7 +321,14 @@ fn run_render_pass(
                 .read_frames(local_offset, &mut mono_buf[..n_frames])?;
 
             if obj_state.xfade_remaining == 0 {
-                accumulate_linear_ramp(&mono_buf[..n_frames], &gains0, &gains1, &mut bus, n_frames);
+                simd::accumulate_linear_ramp_simd(
+                    arch,
+                    &mono_buf[..n_frames],
+                    &gains0,
+                    &gains1,
+                    &mut bus,
+                    n_frames,
+                );
             } else {
                 accumulate_with_crossfade(
                     &mono_buf[..n_frames],
@@ -334,26 +344,7 @@ fn run_render_pass(
             obj_state.initialized = true;
         }
 
-        if (output_scale - 1.0).abs() > f64::EPSILON {
-            for ch in 0..n_spk {
-                for sample in &mut bus.channel_mut(ch)[..n_frames] {
-                    *sample *= output_scale;
-                }
-            }
-        }
-
-        for (ch, ch_stat) in stats.iter_mut().enumerate() {
-            for &sample in &bus.channel(ch)[..n_frames] {
-                let abs = sample.abs();
-                if abs > ch_stat.peak_linear {
-                    ch_stat.peak_linear = abs;
-                }
-                ch_stat.sum_squares += sample * sample;
-                if abs > 1.0 {
-                    ch_stat.clipped_samples += 1;
-                }
-            }
-        }
+        simd::scale_and_meter_bus_simd(arch, &mut bus, n_frames, output_scale, &mut stats);
 
         writer.write_block(&bus, n_frames)?;
         frame_start = block_end;
@@ -367,34 +358,6 @@ fn run_render_pass(
         output_metadata,
         channels: stats,
     })
-}
-
-fn accumulate_linear_ramp(
-    mono: &[f64],
-    gains0: &[f64],
-    gains1: &[f64],
-    bus: &mut PcmBus,
-    n_frames: usize,
-) {
-    let inv_n = 1.0 / (n_frames as f64);
-    for (ch, (&g0, &g1)) in gains0.iter().zip(gains1.iter()).enumerate() {
-        if g0 == 0.0 && g1 == 0.0 {
-            continue;
-        }
-        let out = bus.channel_mut(ch);
-        if (g1 - g0).abs() <= f64::EPSILON {
-            for (dst, &src) in out[..n_frames].iter_mut().zip(mono) {
-                *dst += src * g0;
-            }
-        } else {
-            let dg = (g1 - g0) * inv_n;
-            let mut g = g0;
-            for (dst, &src) in out[..n_frames].iter_mut().zip(mono) {
-                *dst += src * g;
-                g += dg;
-            }
-        }
-    }
 }
 
 fn accumulate_with_crossfade(

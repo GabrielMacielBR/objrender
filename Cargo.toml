@@ -7,6 +7,7 @@ description = "Offline 3D object-based spatial audio renderer for arbitrary spea
 repository = "https://github.com/GabrielMacielBR/objrender"
 
 [dependencies]
+pulp = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_yaml_ng = "0.10"
 thiserror = "2"
@@ -14,5 +15,10 @@ toml = "0.8"
 
 [dev-dependencies]
 approx = "0.5"
+criterion = "0.8"
 hound = "3.5"
 proptest = "1"
+
+[[bench]]
+name = "dsp_kernels"
+harness = false

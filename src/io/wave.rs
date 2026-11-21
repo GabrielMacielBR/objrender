@@ -4,6 +4,9 @@ use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use pulp::Arch;
+
+use crate::io::interleave::{interleave_f32_le_simd, interleave_f64_le_simd};
 use crate::io::{IoError, OutputMetadata, PcmBus, SampleFormat, SampleWriter};
 
 const HEADER_BYTES: u64 = 104; // 12 (RIFF) + 36 (JUNK/ds64) + 48 (fmt ) + 8 (data hdr)
@@ -47,6 +50,7 @@ pub struct WaveWriter<W: Write + Seek> {
     config: WaveConfig,
     frames_written: u64,
     scratch_bytes: Vec<u8>,
+    arch: Arch,
 }
 
 impl WaveWriter<File> {
@@ -72,6 +76,7 @@ impl<W: Write + Seek> WaveWriter<W> {
             config,
             frames_written: 0,
             scratch_bytes: Vec::new(),
+            arch: Arch::new(),
         })
     }
 }
@@ -90,30 +95,12 @@ impl<W: Write + Seek> SampleWriter for WaveWriter<W> {
             return Ok(());
         }
 
-        let bps = self.config.format.bytes_per_sample() as usize;
-        let needed = frames * n_ch * bps;
-        self.scratch_bytes.clear();
-        if self.scratch_bytes.capacity() < needed {
-            self.scratch_bytes
-                .reserve(needed - self.scratch_bytes.capacity());
-        }
-
         match self.config.format {
             SampleFormat::Float32 => {
-                for s in 0..frames {
-                    for ch in 0..n_ch {
-                        let sample = bus.channel(ch)[s] as f32;
-                        self.scratch_bytes.extend_from_slice(&sample.to_le_bytes());
-                    }
-                }
+                interleave_f32_le_simd(self.arch, bus, frames, &mut self.scratch_bytes);
             }
             SampleFormat::Float64 => {
-                for s in 0..frames {
-                    for ch in 0..n_ch {
-                        let sample = bus.channel(ch)[s];
-                        self.scratch_bytes.extend_from_slice(&sample.to_le_bytes());
-                    }
-                }
+                interleave_f64_le_simd(self.arch, bus, frames, &mut self.scratch_bytes);
             }
         }
 
