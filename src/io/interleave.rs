@@ -2,10 +2,130 @@
 
 use pulp::{Arch, Simd, WithSimd};
 
-use crate::io::PcmBus;
+use crate::io::{PcmBus, SampleFormat};
 
 const TILE_FRAMES: usize = 8;
 const TILE_CHANNELS: usize = 16;
+
+/// Deterministic SplitMix64 triangular-PDF (TPDF) dither generator in `(-1.0, +1.0)` LSB.
+#[derive(Debug, Clone)]
+pub struct TpdfDither {
+    state: u64,
+}
+
+impl Default for TpdfDither {
+    fn default() -> Self {
+        Self::with_seed(0x9E37_79B9_7F4A_7C15)
+    }
+}
+
+impl TpdfDither {
+    pub const fn with_seed(seed: u64) -> Self {
+        let s = if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        };
+        Self { state: s }
+    }
+
+    #[inline]
+    fn next_uniform(&mut self) -> f64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // 53-bit uniform mantissa in [0.0, 1.0).
+        ((z >> 11) as f64) * (1.0 / 9_007_199_254_740_992.0)
+    }
+
+    /// Returns a zero-mean TPDF deviate in `(-1.0, +1.0)` LSB.
+    #[inline]
+    pub fn next_lsb(&mut self) -> f64 {
+        self.next_uniform() - self.next_uniform()
+    }
+}
+
+/// Packs planar `f64` frames into interleaved little-endian bytes for any supported [`SampleFormat`].
+pub fn pack_bus_le(
+    arch: Arch,
+    format: SampleFormat,
+    bus: &PcmBus,
+    frames: usize,
+    dither: Option<&mut TpdfDither>,
+    out: &mut Vec<u8>,
+) {
+    match format {
+        SampleFormat::Int16 => interleave_i16_le(bus, frames, dither, out),
+        SampleFormat::Int24 => interleave_i24_le(bus, frames, dither, out),
+        SampleFormat::Float32 => interleave_f32_le_simd(arch, bus, frames, out),
+        SampleFormat::Float64 => interleave_f64_le_simd(arch, bus, frames, out),
+    }
+}
+
+/// Planar-to-interleaved signed 16-bit PCM little-endian packer with optional TPDF dither.
+pub fn interleave_i16_le(
+    bus: &PcmBus,
+    frames: usize,
+    mut dither: Option<&mut TpdfDither>,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    let n_ch = bus.num_channels();
+    if frames == 0 || n_ch == 0 {
+        return;
+    }
+    let needed = frames * n_ch * 2;
+    if out.capacity() < needed {
+        out.reserve(needed - out.capacity());
+    }
+    let channels = bus.channels();
+    for s in 0..frames {
+        for ch_vec in channels {
+            let v = ch_vec[s];
+            let scaled = if v.is_finite() { v * 32_768.0 } else { 0.0 };
+            let noise = match dither.as_deref_mut() {
+                Some(rng) => rng.next_lsb(),
+                None => 0.0,
+            };
+            let q = (scaled + noise).round().clamp(-32_768.0, 32_767.0) as i16;
+            out.extend_from_slice(&q.to_le_bytes());
+        }
+    }
+}
+
+/// Planar-to-interleaved signed 24-bit PCM little-endian packer with optional TPDF dither.
+pub fn interleave_i24_le(
+    bus: &PcmBus,
+    frames: usize,
+    mut dither: Option<&mut TpdfDither>,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    let n_ch = bus.num_channels();
+    if frames == 0 || n_ch == 0 {
+        return;
+    }
+    let needed = frames * n_ch * 3;
+    if out.capacity() < needed {
+        out.reserve(needed - out.capacity());
+    }
+    let channels = bus.channels();
+    for s in 0..frames {
+        for ch_vec in channels {
+            let v = ch_vec[s];
+            let scaled = if v.is_finite() { v * 8_388_608.0 } else { 0.0 };
+            let noise = match dither.as_deref_mut() {
+                Some(rng) => rng.next_lsb(),
+                None => 0.0,
+            };
+            let q = (scaled + noise).round().clamp(-8_388_608.0, 8_388_607.0) as i32;
+            let bytes = q.to_le_bytes();
+            out.extend_from_slice(&bytes[0..3]);
+        }
+    }
+}
 
 /// Scalar reference planar-to-interleaved `f32` little-endian packer.
 pub fn interleave_f32_le_scalar(bus: &PcmBus, frames: usize, out: &mut Vec<u8>) {

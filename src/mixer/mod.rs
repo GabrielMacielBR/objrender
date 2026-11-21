@@ -1,5 +1,6 @@
 //! Offline multi-object mixing, timeline ramping, LFE routing, and render orchestration.
 
+pub mod loudness;
 pub mod simd;
 
 use std::f64::consts::PI;
@@ -7,8 +8,11 @@ use std::f64::consts::PI;
 use rayon::prelude::*;
 use thiserror::Error;
 
+pub use loudness::{LoudnessMeasurement, LoudnessMeter};
+
 use crate::io::{IoError, NullWriter, OutputMetadata, PcmBus, SampleWriter};
 use crate::layout::{SpeakerLayout, SpeakerRole};
+use crate::mixer::loudness::LoudnessAnalyzerWriter;
 use crate::renderer::Spatializer;
 use crate::scene::{AudioObject, ObjectRole, Scene};
 use crate::timeline::{self, ObjectState};
@@ -24,6 +28,12 @@ pub enum ClippingPolicy {
     /// Renders an analysis pass to measure global peak, then scales all channels
     /// uniformly so the highest peak reaches `target_dbfs` (must be finite and `<= 0.0`).
     TwoPassPeakNormalize { target_dbfs: f64 },
+    /// Renders an analysis pass to measure ITU-R BS.1770-4 integrated loudness and 4x true-peak,
+    /// then scales uniformly to reach `target_lufs` capped by `true_peak_ceiling_dbtp`.
+    TwoPassLoudnessNormalize {
+        target_lufs: f64,
+        true_peak_ceiling_dbtp: f64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -89,6 +99,8 @@ pub struct RenderReport {
     pub frames_rendered: u64,
     pub rf64_promoted: bool,
     pub applied_gain_linear: f64,
+    pub integrated_lufs: Option<f64>,
+    pub true_peak_dbtp: Option<f64>,
     pub output_metadata: OutputMetadata,
     pub channels: Vec<ChannelStats>,
 }
@@ -260,6 +272,66 @@ pub fn render_scene(
             };
             run_render_pass(scene, layout, spatializer, config, norm_scale, writer, pool)
         }
+        ClippingPolicy::TwoPassLoudnessNormalize {
+            target_lufs,
+            true_peak_ceiling_dbtp,
+        } => {
+            if !target_lufs.is_finite() || target_lufs > 0.0 {
+                return Err(RenderError::InvalidConfig(
+                    "TwoPassLoudnessNormalize target_lufs must be finite and <= 0.0".to_string(),
+                ));
+            }
+            if !true_peak_ceiling_dbtp.is_finite() || true_peak_ceiling_dbtp > 0.0 {
+                return Err(RenderError::InvalidConfig(
+                    "TwoPassLoudnessNormalize true_peak_ceiling_dbtp must be finite and <= 0.0"
+                        .to_string(),
+                ));
+            }
+            let (analysis_writer, measurement_slot) =
+                LoudnessAnalyzerWriter::pair(scene.sample_rate, layout);
+            run_render_pass(
+                scene,
+                layout,
+                spatializer,
+                config,
+                1.0,
+                analysis_writer,
+                pool,
+            )?;
+            let measured = measurement_slot
+                .lock()
+                .map_err(|_| RenderError::InvalidConfig("loudness meter mutex poisoned".into()))?
+                .take()
+                .unwrap_or(LoudnessMeasurement {
+                    integrated_lufs: f64::NEG_INFINITY,
+                    true_peak_linear: 0.0,
+                });
+
+            let norm_scale = if !measured.integrated_lufs.is_finite() {
+                1.0
+            } else {
+                let desired = 10.0_f64.powf((target_lufs - measured.integrated_lufs) / 20.0);
+                if measured.true_peak_linear > 1e-12 {
+                    let max_tp =
+                        10.0_f64.powf(true_peak_ceiling_dbtp / 20.0) / measured.true_peak_linear;
+                    desired.min(max_tp)
+                } else {
+                    desired
+                }
+            };
+
+            let mut report =
+                run_render_pass(scene, layout, spatializer, config, norm_scale, writer, pool)?;
+            if measured.integrated_lufs.is_finite() {
+                let gain_db = 20.0 * norm_scale.log10();
+                report.integrated_lufs = Some(measured.integrated_lufs + gain_db);
+                report.true_peak_dbtp = Some(measured.true_peak_dbtp() + gain_db);
+            } else {
+                report.integrated_lufs = Some(f64::NEG_INFINITY);
+                report.true_peak_dbtp = Some(measured.true_peak_dbtp());
+            }
+            Ok(report)
+        }
     }
 }
 
@@ -426,6 +498,8 @@ fn run_render_pass(
         frames_rendered: scene.total_frames,
         rf64_promoted: output_metadata.rf64_promoted,
         applied_gain_linear: output_scale,
+        integrated_lufs: None,
+        true_peak_dbtp: None,
         output_metadata,
         channels: stats,
     })

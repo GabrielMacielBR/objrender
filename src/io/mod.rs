@@ -5,7 +5,7 @@ pub mod wave;
 
 use thiserror::Error;
 
-pub use wave::{WaveConfig, WaveWriter};
+pub use wave::{RawPcmWriter, StreamingWaveWriter, WaveConfig, WaveWriter};
 
 #[derive(Debug, Error)]
 pub enum IoError {
@@ -17,6 +17,8 @@ pub enum IoError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleFormat {
+    Int16,
+    Int24,
     Float32,
     Float64,
 }
@@ -25,6 +27,8 @@ impl SampleFormat {
     #[inline]
     pub const fn bytes_per_sample(self) -> u16 {
         match self {
+            Self::Int16 => 2,
+            Self::Int24 => 3,
             Self::Float32 => 4,
             Self::Float64 => 8,
         }
@@ -33,6 +37,32 @@ impl SampleFormat {
     #[inline]
     pub const fn bits_per_sample(self) -> u16 {
         self.bytes_per_sample() * 8
+    }
+
+    #[inline]
+    pub const fn is_float(self) -> bool {
+        matches!(self, Self::Float32 | Self::Float64)
+    }
+}
+
+/// Dither strategy applied when quantizing floating-point PCM to integer sample formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DitherMode {
+    /// Applies TPDF dither automatically for 16-bit integer output and none for 24-bit/float.
+    #[default]
+    Auto,
+    None,
+    Tpdf,
+}
+
+impl DitherMode {
+    #[inline]
+    pub const fn uses_tpdf(self, format: SampleFormat) -> bool {
+        match self {
+            Self::Auto => matches!(format, SampleFormat::Int16),
+            Self::None => false,
+            Self::Tpdf => !format.is_float(),
+        }
     }
 }
 

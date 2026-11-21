@@ -191,12 +191,22 @@ impl SpeakerLayout {
         match name.to_ascii_lowercase().as_str() {
             "mono" | "1.0" => Some(Self::mono()),
             "stereo" | "2.0" => Some(Self::stereo()),
+            "2.1" => Some(Self::layout_2_1()),
+            "3.1.2" => Some(Self::layout_3_1_2()),
+            "4.0" | "quad" => Some(Self::quad_4_0()),
+            "4.1" => Some(Self::layout_4_1()),
+            "5.0" => Some(Self::surround_5_0()),
             "5.1" => Some(Self::surround_5_1()),
-            "7.1" => Some(Self::surround_7_1()),
+            "5.1.2" => Some(Self::layout_5_1_2()),
             "5.1.4" => Some(Self::layout_5_1_4()),
+            "7.0" => Some(Self::surround_7_0()),
+            "7.1" => Some(Self::surround_7_1()),
+            "7.1.2" => Some(Self::layout_7_1_2()),
             "7.1.4" => Some(Self::layout_7_1_4()),
             "7.1.6" => Some(Self::layout_7_1_6()),
+            "9.1.4" => Some(Self::layout_9_1_4()),
             "9.1.6" => Some(Self::layout_9_1_6()),
+            "auro-10.1" | "auro10.1" | "10.1" => Some(Self::auro_10_1()),
             _ => None,
         }
     }
@@ -251,6 +261,74 @@ impl SpeakerLayout {
         .expect("valid stereo preset")
     }
 
+    pub fn layout_2_1() -> Self {
+        Self::new(
+            "2.1",
+            vec![
+                sph(0, "L", 30.0, 0.0, Some(MASK_FL)),
+                sph(1, "R", -30.0, 0.0, Some(MASK_FR)),
+                lfe(2, "LFE", Some(MASK_LFE)),
+            ],
+        )
+        .expect("valid 2.1 preset")
+    }
+
+    pub fn layout_3_1_2() -> Self {
+        Self::new(
+            "3.1.2",
+            vec![
+                sph(0, "L", 30.0, 0.0, Some(MASK_FL)),
+                sph(1, "R", -30.0, 0.0, Some(MASK_FR)),
+                sph(2, "C", 0.0, 0.0, Some(MASK_FC)),
+                lfe(3, "LFE", Some(MASK_LFE)),
+                sph(4, "Ltf", 45.0, 45.0, Some(MASK_TFL)),
+                sph(5, "Rtf", -45.0, 45.0, Some(MASK_TFR)),
+            ],
+        )
+        .expect("valid 3.1.2 preset")
+    }
+
+    pub fn quad_4_0() -> Self {
+        Self::new(
+            "4.0",
+            vec![
+                sph(0, "L", 45.0, 0.0, Some(MASK_FL)),
+                sph(1, "R", -45.0, 0.0, Some(MASK_FR)),
+                sph(2, "Ls", 135.0, 0.0, Some(MASK_BL)),
+                sph(3, "Rs", -135.0, 0.0, Some(MASK_BR)),
+            ],
+        )
+        .expect("valid 4.0 preset")
+    }
+
+    pub fn layout_4_1() -> Self {
+        Self::new(
+            "4.1",
+            vec![
+                sph(0, "L", 45.0, 0.0, Some(MASK_FL)),
+                sph(1, "R", -45.0, 0.0, Some(MASK_FR)),
+                lfe(2, "LFE", Some(MASK_LFE)),
+                sph(3, "Ls", 135.0, 0.0, Some(MASK_BL)),
+                sph(4, "Rs", -135.0, 0.0, Some(MASK_BR)),
+            ],
+        )
+        .expect("valid 4.1 preset")
+    }
+
+    pub fn surround_5_0() -> Self {
+        Self::new(
+            "5.0",
+            vec![
+                sph(0, "L", 30.0, 0.0, Some(MASK_FL)),
+                sph(1, "R", -30.0, 0.0, Some(MASK_FR)),
+                sph(2, "C", 0.0, 0.0, Some(MASK_FC)),
+                sph(3, "Ls", 110.0, 0.0, Some(MASK_BL)),
+                sph(4, "Rs", -110.0, 0.0, Some(MASK_BR)),
+            ],
+        )
+        .expect("valid 5.0 preset")
+    }
+
     pub fn surround_5_1() -> Self {
         Self::new(
             "5.1",
@@ -264,6 +342,39 @@ impl SpeakerLayout {
             ],
         )
         .expect("valid 5.1 preset")
+    }
+
+    pub fn layout_5_1_2() -> Self {
+        Self::new(
+            "5.1.2",
+            vec![
+                sph(0, "L", 30.0, 0.0, Some(MASK_FL)),
+                sph(1, "R", -30.0, 0.0, Some(MASK_FR)),
+                sph(2, "C", 0.0, 0.0, Some(MASK_FC)),
+                lfe(3, "LFE", Some(MASK_LFE)),
+                sph(4, "Ls", 110.0, 0.0, Some(MASK_BL)),
+                sph(5, "Rs", -110.0, 0.0, Some(MASK_BR)),
+                sph(6, "Ltm", 90.0, 45.0, Some(MASK_TFL)),
+                sph(7, "Rtm", -90.0, 45.0, Some(MASK_TFR)),
+            ],
+        )
+        .expect("valid 5.1.2 preset")
+    }
+
+    pub fn surround_7_0() -> Self {
+        Self::new(
+            "7.0",
+            vec![
+                sph(0, "L", 30.0, 0.0, Some(MASK_FL)),
+                sph(1, "R", -30.0, 0.0, Some(MASK_FR)),
+                sph(2, "C", 0.0, 0.0, Some(MASK_FC)),
+                sph(3, "Lrs", 135.0, 0.0, Some(MASK_BL)),
+                sph(4, "Rrs", -135.0, 0.0, Some(MASK_BR)),
+                sph(5, "Lss", 90.0, 0.0, Some(MASK_SL)),
+                sph(6, "Rss", -90.0, 0.0, Some(MASK_SR)),
+            ],
+        )
+        .expect("valid 7.0 preset")
     }
 
     pub fn surround_7_1() -> Self {
@@ -281,6 +392,25 @@ impl SpeakerLayout {
             ],
         )
         .expect("valid 7.1 preset")
+    }
+
+    pub fn layout_7_1_2() -> Self {
+        Self::new(
+            "7.1.2",
+            vec![
+                sph(0, "L", 30.0, 0.0, Some(MASK_FL)),
+                sph(1, "R", -30.0, 0.0, Some(MASK_FR)),
+                sph(2, "C", 0.0, 0.0, Some(MASK_FC)),
+                lfe(3, "LFE", Some(MASK_LFE)),
+                sph(4, "Lrs", 135.0, 0.0, Some(MASK_BL)),
+                sph(5, "Rrs", -135.0, 0.0, Some(MASK_BR)),
+                sph(6, "Lss", 90.0, 0.0, Some(MASK_SL)),
+                sph(7, "Rss", -90.0, 0.0, Some(MASK_SR)),
+                sph(8, "Ltm", 90.0, 45.0, Some(MASK_TFL)),
+                sph(9, "Rtm", -90.0, 45.0, Some(MASK_TFR)),
+            ],
+        )
+        .expect("valid 7.1.2 preset")
     }
 
     pub fn layout_5_1_4() -> Self {
@@ -346,6 +476,29 @@ impl SpeakerLayout {
         .expect("valid 7.1.6 preset")
     }
 
+    pub fn layout_9_1_4() -> Self {
+        Self::new(
+            "9.1.4",
+            vec![
+                sph(0, "L", 30.0, 0.0, None),
+                sph(1, "R", -30.0, 0.0, None),
+                sph(2, "C", 0.0, 0.0, None),
+                lfe(3, "LFE", None),
+                sph(4, "Lw", 60.0, 0.0, None),
+                sph(5, "Rw", -60.0, 0.0, None),
+                sph(6, "Lss", 90.0, 0.0, None),
+                sph(7, "Rss", -90.0, 0.0, None),
+                sph(8, "Lrs", 135.0, 0.0, None),
+                sph(9, "Rrs", -135.0, 0.0, None),
+                sph(10, "Ltf", 45.0, 45.0, None),
+                sph(11, "Rtf", -45.0, 45.0, None),
+                sph(12, "Ltr", 135.0, 45.0, None),
+                sph(13, "Rtr", -135.0, 45.0, None),
+            ],
+        )
+        .expect("valid 9.1.4 preset")
+    }
+
     pub fn layout_9_1_6() -> Self {
         Self::new(
             "9.1.6",
@@ -369,6 +522,26 @@ impl SpeakerLayout {
             ],
         )
         .expect("valid 9.1.6 preset")
+    }
+
+    pub fn auro_10_1() -> Self {
+        Self::new(
+            "auro-10.1",
+            vec![
+                sph(0, "L", 30.0, 0.0, None),
+                sph(1, "R", -30.0, 0.0, None),
+                sph(2, "C", 0.0, 0.0, None),
+                lfe(3, "LFE", None),
+                sph(4, "Ls", 110.0, 0.0, None),
+                sph(5, "Rs", -110.0, 0.0, None),
+                sph(6, "HL", 30.0, 30.0, None),
+                sph(7, "HR", -30.0, 30.0, None),
+                sph(8, "HLs", 110.0, 30.0, None),
+                sph(9, "HRs", -110.0, 30.0, None),
+                sph(10, "VoG", 0.0, 90.0, None),
+            ],
+        )
+        .expect("valid auro-10.1 preset")
     }
 }
 
@@ -420,18 +593,32 @@ mod tests {
         let cases = [
             ("mono", 1),
             ("stereo", 2),
+            ("2.1", 3),
+            ("3.1.2", 6),
+            ("4.0", 4),
+            ("quad", 4),
+            ("4.1", 5),
+            ("5.0", 5),
             ("5.1", 6),
-            ("7.1", 8),
+            ("5.1.2", 8),
             ("5.1.4", 10),
+            ("7.0", 7),
+            ("7.1", 8),
+            ("7.1.2", 10),
             ("7.1.4", 12),
             ("7.1.6", 14),
+            ("9.1.4", 14),
             ("9.1.6", 16),
+            ("auro-10.1", 11),
         ];
         for (name, count) in cases {
             let layout = SpeakerLayout::preset(name).expect("preset must exist");
             assert_eq!(layout.speakers.len(), count);
         }
         assert_eq!(SpeakerLayout::surround_5_1().channel_mask(), 0x3F);
+        assert_eq!(SpeakerLayout::layout_3_1_2().channel_mask(), 0x500F);
+        assert_eq!(SpeakerLayout::layout_5_1_2().channel_mask(), 0x503F);
+        assert_eq!(SpeakerLayout::layout_7_1_2().channel_mask(), 0x563F);
         assert_eq!(SpeakerLayout::layout_7_1_4().channel_mask(), 0x2_D63F);
     }
 
@@ -497,12 +684,34 @@ mod tests {
         assert_eq!(smpte_714.channel_mask(), 0);
         assert!(smpte_714.validate().is_ok());
 
-        for preset in [SpeakerLayout::surround_7_1(), SpeakerLayout::layout_7_1_6()] {
+        for preset in [
+            SpeakerLayout::surround_7_0(),
+            SpeakerLayout::surround_7_1(),
+            SpeakerLayout::layout_7_1_2(),
+            SpeakerLayout::layout_7_1_6(),
+        ] {
             let smpte = preset.with_channel_order(ChannelOrder::Smpte);
-            assert_eq!(smpte.speakers[4].label, "Lss");
-            assert_eq!(smpte.speakers[5].label, "Rss");
-            assert_eq!(smpte.speakers[6].label, "Lrs");
-            assert_eq!(smpte.speakers[7].label, "Rrs");
+            let lss = smpte
+                .speakers
+                .iter()
+                .position(|s| s.label == "Lss")
+                .unwrap();
+            let lrs = smpte
+                .speakers
+                .iter()
+                .position(|s| s.label == "Lrs")
+                .unwrap();
+            let rss = smpte
+                .speakers
+                .iter()
+                .position(|s| s.label == "Rss")
+                .unwrap();
+            let rrs = smpte
+                .speakers
+                .iter()
+                .position(|s| s.label == "Rrs")
+                .unwrap();
+            assert!(lss < lrs && rss < rrs);
         }
 
         let smpte_51 = SpeakerLayout::surround_5_1().with_channel_order(ChannelOrder::Smpte);
