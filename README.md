@@ -2,8 +2,8 @@
 
 An open-source, specialized **offline 3D object-based spatial audio renderer** written in Rust.
 
-> **Status: Early Design / Pre-Alpha**
-> The repository is currently in the initial architecture and design phase. Architecture documentation, module specs, and crate selections are being finalized before the first Rust code is committed. See [CLAUDE.md](./CLAUDE.md) for full engineering guidelines.
+> **Status: Phase 1 Static MVP Implemented**
+> Single static 3D object rendering to arbitrary speaker layouts (1D/2D/3D VBAP, WAV/RF64 export, CLI, and `proptest`/`hound` verification) is working. See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) and [CLAUDE.md](./CLAUDE.md) for architecture and roadmap details.
 
 ---
 

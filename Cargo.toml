@@ -1,0 +1,17 @@
+[package]
+name = "objrender"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Offline 3D object-based spatial audio renderer for arbitrary speaker layouts"
+repository = "https://github.com/GabrielMacielBR/objrender"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.8"
+
+[dev-dependencies]
+approx = "0.5"
+hound = "3.5"
+proptest = "1"

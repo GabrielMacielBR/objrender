@@ -239,20 +239,8 @@ src/
 
 ---
 
-## 12. Current Status & Next Step (Architecture Phase)
+## 12. Current Status & Next Step
 
-**Current Stage**: Pre-implementation repository bootstrap. No Rust crate (`Cargo.toml`) or source code exists yet.
+**Current Stage**: **Phase 1 Static MVP implemented and verified** (`math`, `layout`, `scene`, `renderer` with Omniphony pure-Rust `convhull` + `vbap_native`, `io` WAV/RF64 writer, `mixer`, `importers::damf` stub, CLI, and `hound`/`proptest` tests). Architecture deliverables 1–10 are documented in [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md).
 
-Before writing Phase 1 Rust code, the team must finalize and document the **10 architecture deliverables**:
-1. Complete system architecture
-2. Module dependency diagram
-3. End-to-end data flow
-4. Core Rust data structures
-5. Core traits (kept minimal and purposeful)
-6. Core rendering & panning pseudocode
-7. Exact Phase 1 MVP specification
-8. Phased implementation plan & crate selections
-9. Verification & testing strategy (math invariants, energy conservation, golden WAV outputs)
-10. Technical risks & mitigations
-
-**Implementation Rule**: Start with the simplest possible working MVP capable of accurately rendering a scene containing a **single static object** to an **arbitrary speaker layout** as a **WAV** file. Only after that baseline is tested and verified should we evolve toward movement, automation, importer integration, and SIMD/parallel optimizations.
+**Next Step (Phase 2)**: Add `src/timeline/` (keyframe interpolation, per-sample linear gain ramping, discontinuity crossfades) and connect it to `src/mixer/`.

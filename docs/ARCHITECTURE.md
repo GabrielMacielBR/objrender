@@ -1,6 +1,6 @@
 # objrender — Architecture & Technical Design Specification
 
-> **Status:** Architecture Specification (Phase 1 MVP In Progress)  
+> **Status:** Architecture Specification (Phase 1 Static MVP Implemented)  
 > **License:** `GPL-3.0-or-later` (see `LICENSE`)
 
 This document defines the complete software architecture, mathematical models, DSP algorithms, Rust data types, crate selections, phased implementation plan, verification strategy, and technical risks for **objrender**.
